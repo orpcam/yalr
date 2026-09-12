@@ -2487,6 +2487,45 @@ static PREV_SAMPLES: once_cell::sync::Lazy<
     >,
 > = once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Mini-Cache (1s TTL) NUR fuer den on-demand-Scrape-Pfad der
+/// Upstream-Counter im /metrics-Handler: verhindert, dass schnelle Scrapes
+/// (z.B. 1s-Poll) die Provider-/metrics-Endpoints fluten. Schreibt NICHT in
+/// den 2s-METRICS_CACHE (dessen Eintraege tragen Delta-Raten vom
+/// live_stats-Pfad) und faehrt PREV_SAMPLES nicht an.
+type UpstreamScrapeCacheValue =
+    (std::time::Instant, Vec<(String, ProviderMetricsEntry)>);
+
+static UPSTREAM_SCRAPE_CACHE: once_cell::sync::Lazy<
+    tokio::sync::Mutex<Option<UpstreamScrapeCacheValue>>,
+> = once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(None));
+
+/// Liefert die Provider-/metrics-Eintraege fuer den on-demand-Scrape mit
+/// 1s-Cache. Cache frisch (<1s) -> geklonter Cache-Stand; sonst frischer
+/// Fetch. PG-Fehler -> leerer Vec (debug statt warn: laeuft pro Scrape,
+/// PG-down ist ueber die 30s-Upstream-Sektion + Age-Gauge sichtbar).
+async fn upstream_scrape_entries(
+    state: &AppState,
+) -> Vec<(String, ProviderMetricsEntry)> {
+    {
+        let cache = UPSTREAM_SCRAPE_CACHE.lock().await;
+        if let Some((at, entries)) = cache.as_ref() {
+            if at.elapsed() < std::time::Duration::from_secs(1) {
+                return entries.clone();
+            }
+        }
+    }
+    let rows = match load_enabled_providers(state).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::debug!("upstream-scrape-cache: provider-laden fehlgeschlagen: {e}");
+            return Vec::new();
+        }
+    };
+    let (entries, _from_cache) = fetch_and_parse_provider_metrics(state, rows).await;
+    *UPSTREAM_SCRAPE_CACHE.lock().await = Some((std::time::Instant::now(), entries.clone()));
+    entries
+}
+
 /// Ein aktiver (enabled) Provider aus Postgres fuer die Metrics-/Upstream-Sektionen.
 #[derive(sqlx::FromRow)]
 struct MetricsProviderRow {
@@ -3174,6 +3213,57 @@ pub fn render_upstream_exposition(groups: &[UpstreamGroup], providers_enabled: u
     body
 }
 
+/// Rendert die Engine-Counter-Familien der Upstream-Tokenzähler aus den
+/// on-demand gescrapten Provider-/metrics-Eintraegen. Absolute Rohcounter
+/// (vllm/sglang), beim Scrape gesampelt, über Engine-Serien summiert —
+/// aktualisieren sich während der Generation. None-Werte werden nicht
+/// gerendert (kein NaN); Counter-Reset beim Provider-Restart ist moeglich
+/// und normal (Consumer behandelt den Reset). Leerer Input -> leerer String.
+/// Stabile Reihenfolge: alphabetisch absteigend nach provider_name (wie die
+/// Upstream-Sektion).
+fn render_upstream_token_counters(
+    entries: &[(String, ProviderMetricsEntry)],
+) -> String {
+    let mut body = String::new();
+    if entries.is_empty() {
+        return body;
+    }
+    let mut sorted: Vec<&(String, ProviderMetricsEntry)> = entries.iter().collect();
+    sorted.sort_by(|a, b| b.0.cmp(&a.0));
+
+    body.push_str(
+        "# HELP yalr_upstream_prompt_tokens_total Prompt tokens sampled at scrape time from the provider /metrics endpoint (vllm/sglang raw engine counters, summed over labeled series)\n",
+    );
+    body.push_str("# TYPE yalr_upstream_prompt_tokens_total counter\n");
+    for (name, e) in &sorted {
+        if let Some(v) = e.prompt_tokens_total {
+            body.push_str(&format!(
+                "yalr_upstream_prompt_tokens_total{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+                escape_label(&e.kind),
+                escape_label(name),
+                fmt_f64(v)
+            ));
+        }
+    }
+
+    body.push_str(
+        "# HELP yalr_upstream_generation_tokens_total Generation tokens sampled at scrape time from the provider /metrics endpoint (vllm/sglang raw engine counters, summed over labeled series)\n",
+    );
+    body.push_str("# TYPE yalr_upstream_generation_tokens_total counter\n");
+    for (name, e) in &sorted {
+        if let Some(v) = e.gen_tokens_total {
+            body.push_str(&format!(
+                "yalr_upstream_generation_tokens_total{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+                escape_label(&e.kind),
+                escape_label(name),
+                fmt_f64(v)
+            ));
+        }
+    }
+
+    body
+}
+
 /// Rendert die aktuell in-flight laufenden Requests pro (provider, provider_name).
 /// Wird on-demand im metrics_handler gerendert (scrape-aktuell, kein Snapshot).
 pub fn render_in_flight_exposition(in_flight: &[ingest::InFlightReq]) -> String {
@@ -3476,12 +3566,14 @@ fn push_age_metric(body: &mut String, metric: &str, help: &str, built_at: Option
 }
 
 /// Konkatentiert die /metrics-Sektionen in fester Reihenfolge (reine
-/// Funktion, testbar): Latenz (24h), Live (60s), Upstream, Snapshot-
-/// Metadaten, In-Flight, kumulative Counter.
+/// Funktion, testbar): Latenz (24h), Live (60s), Upstream (30s),
+/// Upstream-Counter (on-demand), Snapshot-Metadaten, In-Flight, kumulative
+/// Counter.
 pub fn compose_metrics_body(
     latency: &str,
     live: &str,
     upstream: &str,
+    upstream_counters: &str,
     snapshot: &str,
     in_flight: &str,
     counters: &str,
@@ -3493,6 +3585,8 @@ pub fn compose_metrics_body(
             .len()
             + upstream
             .len()
+            + upstream_counters
+            .len()
             + snapshot
             .len()
             + in_flight
@@ -3503,6 +3597,7 @@ pub fn compose_metrics_body(
     body.push_str(latency);
     body.push_str(live);
     body.push_str(upstream);
+    body.push_str(upstream_counters);
     body.push_str(snapshot);
     body.push_str(in_flight);
     body.push_str(counters);
@@ -3543,12 +3638,19 @@ pub async fn metrics_handler(State(state): State<AppState>, headers: HeaderMap) 
     let snapshot_part = render_snapshot_exposition(&snap);
     let in_flight_part = render_in_flight_exposition(&in_flight);
     let counter_part = render_counter_exposition(&entries, auth_failures, dropped);
+    // Upstream-Engine-Counter (on-demand, 1s-Scrape-Cache): PG-Fehler laesst
+    // die Sektion leer (debug, da pro Scrape).
+    let upstream_counter_part = render_upstream_token_counters(
+        &upstream_scrape_entries(&state).await,
+    );
     // Sektionen in fester Reihenfolge: Latenz (24h), Live (60s), Upstream,
-    // Snapshot-Metadaten, on-demand In-Flight, kumulative Counter.
+    // Upstream-Counter (on-demand), Snapshot-Metadaten, on-demand In-Flight,
+    // kumulative Counter.
     let body = compose_metrics_body(
         &snap.latency_body,
         &snap.live_body,
         &snap.upstream_body,
+        &upstream_counter_part,
         &snapshot_part,
         &in_flight_part,
         &counter_part,
@@ -3879,6 +3981,7 @@ mod metrics_tests {
             "yalr_request_duration_seconds{quantile=\"0.5\"} 1\n",
             "yalr_live_requests{provider=\"p\"} 2\n",
             "yalr_upstream_up{provider=\"p\"} 1\n",
+            "yalr_upstream_prompt_tokens_total{provider=\"p\"} 5\n",
             "yalr_clickhouse_up 1\n",
             "yalr_in_flight_requests{provider=\"p\"} 3\n",
             "yalr_requests_total 4\n",
@@ -3887,21 +3990,108 @@ mod metrics_tests {
         assert!(body.contains("yalr_request_duration_seconds{quantile=\"0.5\"} 1"));
         assert!(body.contains("yalr_live_requests{provider=\"p\"} 2"));
         assert!(body.contains("yalr_upstream_up{provider=\"p\"} 1"));
+        assert!(body.contains("yalr_upstream_prompt_tokens_total{provider=\"p\"} 5"));
         assert!(body.contains("yalr_clickhouse_up 1"));
         assert!(body.contains("yalr_in_flight_requests{provider=\"p\"} 3"));
         assert!(body.contains("yalr_requests_total 4"));
-        // feste Reihenfolge: Latenz < Live < Upstream < Snapshot < In-Flight < Counter
+        // feste Reihenfolge: Latenz < Live < Upstream < Upstream-Counter <
+        // Snapshot < In-Flight < Counter
         let pos = |s: &str| body.find(s).expect("Sektion fehlt");
         assert!(pos("yalr_request_duration_seconds") < pos("yalr_live_requests"));
         assert!(pos("yalr_live_requests") < pos("yalr_upstream_up"));
-        assert!(pos("yalr_upstream_up") < pos("yalr_clickhouse_up"));
+        assert!(pos("yalr_upstream_up") < pos("yalr_upstream_prompt_tokens_total"));
+        assert!(pos("yalr_upstream_prompt_tokens_total") < pos("yalr_clickhouse_up"));
         assert!(pos("yalr_clickhouse_up") < pos("yalr_in_flight_requests"));
         assert!(pos("yalr_in_flight_requests") < pos("yalr_requests_total"));
 
         // leere Sektionen: Rest unveraendert in richtiger Reihenfolge
-        let body =
-            super::compose_metrics_body("", "", "", "yalr_clickhouse_up 1\n", "", "yalr_requests_total 4\n");
+        let body = super::compose_metrics_body(
+            "", "", "", "", "yalr_clickhouse_up 1\n", "", "yalr_requests_total 4\n",
+        );
         assert_eq!(body, "yalr_clickhouse_up 1\nyalr_requests_total 4\n");
+    }
+
+    /// Test-Doppel: Entry nur mit den fuer die Upstream-Counter relevanten
+    /// Feldern befuellt (provider_id/fetched_at sind fuer das Rendering
+    /// irrelevant).
+    fn upstream_entry(kind: &str, gen: Option<f64>, prompt: Option<f64>) -> super::ProviderMetricsEntry {
+        super::ProviderMetricsEntry {
+            provider_id: uuid::Uuid::nil(),
+            kind: kind.to_string(),
+            metrics_url: None,
+            queued: None,
+            running: None,
+            kv_cache_usage: None,
+            decode_tps: None,
+            decode_tps_live: None,
+            prefill_tps_live: None,
+            gen_tokens_total: gen,
+            prompt_tokens_total: prompt,
+            fetched_at: std::time::Instant::now(),
+            fetch_ok: true,
+        }
+    }
+
+    #[test]
+    fn test_render_upstream_token_counters() {
+        // leerer Input -> leerer String (auch keine HELP/TYPE-Zeilen)
+        assert_eq!(super::render_upstream_token_counters(&[]), "");
+
+        // normales Rendering: beide Familien, Labels, stabile Reihenfolge
+        // (absteigend nach provider_name), Zahlen via fmt_f64
+        let entries = vec![
+            ("Alpha".to_string(), upstream_entry("openai_compat", Some(100.0), Some(50.5))),
+            ("Beta".to_string(), upstream_entry("openai_compat", Some(7.0), Some(3.0))),
+        ];
+        let body = super::render_upstream_token_counters(&entries);
+        assert!(body.contains(
+            "# HELP yalr_upstream_prompt_tokens_total Prompt tokens sampled at scrape time from the provider /metrics endpoint (vllm/sglang raw engine counters, summed over labeled series)"
+        ));
+        assert!(body.contains("# TYPE yalr_upstream_prompt_tokens_total counter"));
+        assert!(body.contains(
+            "# HELP yalr_upstream_generation_tokens_total Generation tokens sampled at scrape time from the provider /metrics endpoint (vllm/sglang raw engine counters, summed over labeled series)"
+        ));
+        assert!(body.contains("# TYPE yalr_upstream_generation_tokens_total counter"));
+        assert!(body.contains(
+            "yalr_upstream_generation_tokens_total{provider=\"openai_compat\", provider_name=\"Beta\"} 7"
+        ));
+        assert!(body.contains(
+            "yalr_upstream_generation_tokens_total{provider=\"openai_compat\", provider_name=\"Alpha\"} 100"
+        ));
+        assert!(body.contains(
+            "yalr_upstream_prompt_tokens_total{provider=\"openai_compat\", provider_name=\"Beta\"} 3"
+        ));
+        assert!(body.contains(
+            "yalr_upstream_prompt_tokens_total{provider=\"openai_compat\", provider_name=\"Alpha\"} 50.5"
+        ));
+        // HELP/TYPE vor den Samples
+        assert!(body.find("# TYPE yalr_upstream_generation_tokens_total counter")
+            .unwrap()
+            < body.find("yalr_upstream_generation_tokens_total{").unwrap());
+        // absteigende Reihenfolge: Beta vor Alpha
+        assert!(body.find("provider_name=\"Beta\"").unwrap()
+            < body.find("provider_name=\"Alpha\"").unwrap());
+
+        // None-Wert -> Serie fehlt (kein NaN), andere Familie bleibt
+        let entries = vec![(
+            "Gamma".to_string(),
+            upstream_entry("openai_compat", None, Some(42.0)),
+        )];
+        let body = super::render_upstream_token_counters(&entries);
+        assert!(!body.contains("generation_tokens_total{"));
+        assert!(!body.contains("NaN"));
+        assert!(body.contains(
+            "yalr_upstream_prompt_tokens_total{provider=\"openai_compat\", provider_name=\"Gamma\"} 42"
+        ));
+
+        // Label-Escaping: \\, \", \\n in provider_name
+        let entries = vec![(
+            "Bad\"Name\nB".to_string(),
+            upstream_entry("p\\k", Some(1.0), None),
+        )];
+        let body = super::render_upstream_token_counters(&entries);
+        assert!(body.contains(r##"yalr_upstream_generation_tokens_total{provider="p\\k", provider_name="Bad\"Name\nB"} 1"##));
+        assert!(!body.contains("Bad\"Name"));
     }
 
     #[test]
