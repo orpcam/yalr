@@ -92,25 +92,67 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Latenz-Snapshot-Task: alle 30s eine 24h-CH-Query, Ergebnis in den
-    // Snapshot-Store schreiben. Handle wird wie der Ingest-Handle geboxt und
-    // gedroppt (kein graceful Shutdown noetig).
+    // Metrik-Snapshot-Task: alle 30s die drei Sektionen (Latenz 24h, Live 60s,
+    // Upstream) unabhängig voneinander bauen und in den Snapshot-Store
+    // schreiben. Handle wird wie der Ingest-Handle geboxt und gedroppt
+    // (kein graceful Shutdown noetig).
     let state_snapshot = state.clone();
     let _metrics_handle = Box::new(tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
-            match dashboard::handlers::build_metrics_snapshot_body(&state_snapshot).await {
+
+            // a) Latenz-Sektion (24h): bei CH-Fehler alten Body behalten
+            let latency_ok = match dashboard::handlers::build_latency_body(&state_snapshot).await {
                 Ok(body) => {
                     let mut snap = state_snapshot.metrics_snapshot.write().await;
-                    snap.exposition_body = body;
-                    snap.clickhouse_up = Some(true);
-                    snap.built_at = Some(chrono::Utc::now());
+                    snap.latency_body = body;
+                    snap.latency_built_at = Some(chrono::Utc::now());
+                    true
                 }
                 Err(e) => {
-                    tracing::warn!("metrics snapshot query failed, keeping previous: {e}");
+                    tracing::warn!("latency metrics query failed, keeping previous: {e}");
+                    false
+                }
+            };
+
+            // b) Live-Sektion (60s): bei CH-Fehler Body leeren (Staleness)
+            let live_ok = match dashboard::handlers::build_live_body(&state_snapshot).await {
+                Ok(body) => {
                     let mut snap = state_snapshot.metrics_snapshot.write().await;
-                    snap.clickhouse_up = Some(false);
+                    snap.live_body = body;
+                    snap.live_built_at = Some(chrono::Utc::now());
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!("live metrics query failed, clearing: {e}");
+                    let mut snap = state_snapshot.metrics_snapshot.write().await;
+                    snap.live_body = String::new();
+                    false
+                }
+            };
+
+            // clickhouse_up: true nur, wenn BEIDE CH-abhaengigen Sektionen in
+            // diesem Zyklus gebaut wurden (AND-Kombination, kein Last-Write-Wins).
+            {
+                let mut snap = state_snapshot.metrics_snapshot.write().await;
+                snap.clickhouse_up = Some(latency_ok && live_ok);
+            }
+
+            // c) Upstream-Sektion: Provider-/metrics-Endpunkte alle 30s
+            // abfragen - bewusst wie ein Prometheus-Scrape (Upstream-Traffic
+            // ist Teil der Metrik). Bei PG-Fehler alten Stand behalten:
+            // upstream_body bleibt, upstream_built_at wird NICHT aktualisiert
+            // (Age-Gauge laeuft an -> sichtbar, statt leeres Body als
+            // "0 enabled Provider" zu rendern).
+            match dashboard::handlers::build_upstream_body(&state_snapshot).await {
+                Ok(body) => {
+                    let mut snap = state_snapshot.metrics_snapshot.write().await;
+                    snap.upstream_body = body;
+                    snap.upstream_built_at = Some(chrono::Utc::now());
+                }
+                Err(e) => {
+                    tracing::warn!("upstream metrics load failed, keeping previous: {e}");
                 }
             }
         }

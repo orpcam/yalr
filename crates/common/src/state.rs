@@ -11,17 +11,28 @@ use uuid::Uuid;
 use ingest::LogSink;
 use providers::{ProviderKind, RouteTarget};
 
-/// Cache fuer die CH-abhaengigen /metrics-Anteile (Latenz-Quantile).
-/// Wird alle 30s von einem Background-Task in yalr/main.rs erneuert.
+/// Cache fuer die /metrics-Sektionen (Latenz 24h, Live 60s, Upstream-Engines).
+/// Wird alle 30s von einem Background-Task in yalr/main.rs erneuert; die
+/// Sektionen sind unabhaengig (eigener Build-Zeitpunkt, eigener Fehlerfall).
 #[derive(Debug, Clone, Default)]
 pub struct MetricsSnapshot {
-    /// Fertig gerenderte Prometheus-Textzeilen der CH-abhaengigen Metriken.
-    pub exposition_body: String,
-    /// true/false nach dem ersten Snapshot-Bau; None = noch nie gebaut
+    /// Fertig gerenderte Prometheus-Textzeilen der 24h-Latenz-Sektion.
+    pub latency_body: String,
+    /// Zeitpunkt des letzten erfolgreichen Baus der Latenz-Sektion (fuer Age-Metrik).
+    pub latency_built_at: Option<DateTime<Utc>>,
+    /// Fertig gerenderte Prometheus-Textzeilen der 60s-Live-Sektion.
+    pub live_body: String,
+    /// Zeitpunkt des letzten erfolgreichen Baus der Live-Sektion (fuer Age-Metrik).
+    pub live_built_at: Option<DateTime<Utc>>,
+    /// Fertig gerenderte Prometheus-Textzeilen der Upstream-Engine-Sektion.
+    pub upstream_body: String,
+    /// Zeitpunkt des letzten Baus der Upstream-Sektion (fuer Age-Metrik).
+    pub upstream_built_at: Option<DateTime<Utc>>,
+    /// true nur, wenn BEIDE CH-abhaengigen Sektionen (Latenz + Live) in dem
+    /// aktuellen Zyklus gebaut wurden; false, wenn mindestens eine fehlgeschlagen
+    /// ist (AND-Kombination, kein Last-Write-Wins). None = noch nie gebaut
     /// (dann wird die Metric-Zeile nicht gerendert, statt eine falsche 0).
     pub clickhouse_up: Option<bool>,
-    /// Zeitpunkt des letzten erfolgreichen Baus (fuer Age-Metrik).
-    pub built_at: Option<DateTime<Utc>>,
 }
 
 /// Ein Virtual Key (aus Postgres, gecached).

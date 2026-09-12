@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::auth;
 use common::state::AppState;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
 fn unauthorized() -> Response {
@@ -2456,7 +2456,8 @@ struct ProviderMetricsEntry {
     metrics_url: Option<String>,
     queued: Option<f64>,
     running: Option<f64>,
-    /// kv-cache-auslastung (ratio 0..1), falls der engine sie exportiert
+    /// kv-cache-auslastung (roh, summe ueber Ranks/Instanzen, kann > 1),
+    /// falls der engine sie exportiert
     kv_cache_usage: Option<f64>,
     /// live decode-rate (token/s) aus dem vllm-histogramm, falls vorhanden
     decode_tps: Option<f64>,
@@ -2470,6 +2471,9 @@ struct ProviderMetricsEntry {
     prompt_tokens_total: Option<f64>,
     /// Zeitpunkt des Fetchs fuer die Counter-Delta-Rate
     fetched_at: std::time::Instant,
+    /// true = /metrics-Fetch erfolgreich (2xx + Prometheus-Format), sonst
+    /// false (inkl. fehlende metrics_url / Timeout / nicht-Prometheus-Body)
+    fetch_ok: bool,
 }
 
 static METRICS_CACHE: once_cell::sync::Lazy<tokio::sync::Mutex<Option<(std::time::Instant, std::collections::HashMap<String, ProviderMetricsEntry>)>>> =
@@ -2483,37 +2487,60 @@ static PREV_SAMPLES: once_cell::sync::Lazy<
     >,
 > = once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
-async fn fetch_provider_metrics(
-    state: &AppState,
-) -> std::collections::HashMap<String, ProviderMetricsEntry> {
-    // cache pruefen (2s frisch)
-    {
-        let cache = METRICS_CACHE.lock().await;
-        if let Some((at, map)) = cache.as_ref() {
-            if at.elapsed() < std::time::Duration::from_secs(2) {
-                return map.clone();
-            }
-        }
-    }
+/// Ein aktiver (enabled) Provider aus Postgres fuer die Metrics-/Upstream-Sektionen.
+#[derive(sqlx::FromRow)]
+struct MetricsProviderRow {
+    id: Uuid,
+    name: String,
+    kind: String,
+    metrics_url: Option<String>,
+}
 
-    // alle aktiven provider laden: die null-zeilen-union braucht auch
-    // provider ohne metrics_url (sonst fehlen sie bei leerem traffic komplett)
-    #[derive(sqlx::FromRow)]
-    struct MetricsProviderRow {
-        id: Uuid,
-        name: String,
-        kind: String,
-        metrics_url: Option<String>,
-    }
-    let rows = match sqlx::query_as::<_, MetricsProviderRow>(
+/// Laedt alle enabled Provider aus Postgres (nur die PG-Query, ohne HTTP).
+/// Bei PG-Fehler wird die Error durchgereicht und NICHT in eine leere Map
+/// umgewandelt - der Aufrufer entscheidet (live_stats rendert wie bisher
+/// leer, der 30s-Task haelt den alten Stand).
+/// Die null-zeilen-union braucht auch provider ohne metrics_url (sonst
+/// fehlen sie bei leerem traffic komplett).
+async fn load_enabled_providers(
+    state: &AppState,
+) -> Result<Vec<MetricsProviderRow>, String> {
+    sqlx::query_as::<_, MetricsProviderRow>(
         "SELECT id, name, kind, metrics_url FROM providers WHERE enabled = TRUE",
     )
     .fetch_all(&state.pg)
     .await
-    {
-        Ok(r) => r,
-        Err(_) => return std::collections::HashMap::new(),
-    };
+    .map_err(|e| e.to_string())
+}
+
+/// Frischen (max. 2s alten) METRICS_CACHE-Stand liefern, falls vorhanden.
+/// Wird von beiden pfaden genutzt: live_stats (fruehzeitiger return ohne
+/// pg-query, wie vor dem metrics-umbau) und dem 30s-task (nur lesezugriff,
+/// kein fetch noetig).
+async fn fresh_metrics_cache() -> Option<std::collections::HashMap<String, ProviderMetricsEntry>> {
+    let cache = METRICS_CACHE.lock().await;
+    if let Some((at, map)) = cache.as_ref() {
+        if at.elapsed() < std::time::Duration::from_secs(2) {
+            return Some(map.clone());
+        }
+    }
+    None
+}
+
+/// Holt die /metrics-Endpunkte der Provider und parst die Werte (inkl.
+/// fetch_ok). Liesst den geteilten 2s-METRICS_CACHE (Cache-Hit -> kein
+/// Fetch), schreibt ihn aber NICHT: geschrieben wird nur vom
+/// live_stats-Pfad, damit der 30s-Metrics-Task die PREV_SAMPLES-Baseline
+/// der Delta-Raten nicht vorfaehrt.
+/// Return: (Eintraege, aus-Cache)
+async fn fetch_and_parse_provider_metrics(
+    state: &AppState,
+    rows: Vec<MetricsProviderRow>,
+) -> (Vec<(String, ProviderMetricsEntry)>, bool) {
+    // cache pruefen (2s frisch)
+    if let Some(map) = fresh_metrics_cache().await {
+        return (map.into_iter().collect(), true);
+    }
 
     // parallel fetchen (kurzer timeout: das live-dashboard wartet nicht auf haengende endpoints)
     let client = &state.http;
@@ -2528,7 +2555,7 @@ async fn fetch_provider_metrics(
                 // bei fetch-fehler (timeout/nicht-2xx/parse) trotzdem einen
                 // eintrag mit allen-none-werten erzeugen, damit die zeile im
                 // dashboard stabil bleibt und nicht flackert
-                let (queued, running, decode_tps, gen_tokens, prompt_tokens, kv_cache) =
+                let (queued, running, decode_tps, gen_tokens, prompt_tokens, kv_cache, fetch_ok) =
                     match &metrics_url {
                         Some(url) => {
                             let fetch = client
@@ -2538,8 +2565,23 @@ async fn fetch_provider_metrics(
                                 .await;
                             match fetch {
                                 Ok(resp) if resp.status().is_success() => {
-                                    match resp.text().await {
-                                        Ok(body) => {
+                                    // Body-Read mit hartem 2s-Timeout: ein
+                                    // trickelnder Provider-Body darf den Pfad
+                                    // nicht unbestimmt blockieren (die
+                                    // read_timeout des Clients ist nur ein
+                                    // Stall-Guard). Fixt auch den latenten
+                                    // Blocker im live_stats-Pfad (bewusste
+                                    // Verbesserung, keine semantische
+                                    // Aenderung).
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_secs(2),
+                                        resp.text(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(body))
+                                            if common::metrics::looks_like_prometheus(&body) =>
+                                        {
                                             let (queued, running) =
                                                 common::metrics::queue_metrics(&body);
                                             let decode_tps =
@@ -2555,15 +2597,19 @@ async fn fetch_provider_metrics(
                                                 gen_tokens,
                                                 prompt_tokens,
                                                 kv_cache,
+                                                true,
                                             )
                                         }
-                                        Err(_) => (None, None, None, None, None, None),
+                                        // Timeout / Read-Fehler / 2xx mit
+                                        // nicht-Prometheus-Body (HTML-Login
+                                        // etc.): Fetch-Fehler, kein Erfolg
+                                        _ => (None, None, None, None, None, None, false),
                                     }
                                 }
-                                _ => (None, None, None, None, None, None),
+                                _ => (None, None, None, None, None, None, false),
                             }
                         }
-                        None => (None, None, None, None, None, None),
+                        None => (None, None, None, None, None, None, false),
                     };
                 (
                     name,
@@ -2580,12 +2626,43 @@ async fn fetch_provider_metrics(
                         gen_tokens_total: gen_tokens,
                         prompt_tokens_total: prompt_tokens,
                         fetched_at: std::time::Instant::now(),
+                        fetch_ok,
                     },
                 )
             }
         })
         .collect();
-    let mut results = futures::future::join_all(futures).await;
+    let results = futures::future::join_all(futures).await;
+    (results, false)
+}
+
+/// Provider-Metriken fuer live_stats: enabled Provider laden, /metrics-Werte
+/// holen (geteilter 2s-Cache) und die Counter-Delta-Raten gegen die
+/// PREV_SAMPLES-Baseline berechnen. Bei PG-Fehler leere Map, exakt wie
+/// bisher (live_stats laeuft trotzdem). Der 30s-Metrics-Task nutzt
+/// load_enabled_providers + fetch_and_parse_provider_metrics direkt, ohne
+/// diesen Baseline-Pfad.
+async fn fetch_provider_metrics(
+    state: &AppState,
+) -> std::collections::HashMap<String, ProviderMetricsEntry> {
+    // cache zuerst pruefen (wie vor dem metrics-umbau): bei frischem cache
+    // keine pg-query, gecachten stand inkl. delta-raten liefern
+    if let Some(map) = fresh_metrics_cache().await {
+        return map;
+    }
+
+    let rows = match load_enabled_providers(state).await {
+        Ok(r) => r,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+
+    let (mut results, from_cache) = fetch_and_parse_provider_metrics(state, rows).await;
+
+    if from_cache {
+        // Cache-Hit: exakt den Stand des letzten echten fetchs liefern
+        // (inkl. Delta-Raten), PREV_SAMPLES bleibt unangetastet
+        return results.into_iter().collect();
+    }
 
     // live counter-delta-rates: gegen den vorherigen echten fetch pro provider
     // vergleichen (zeitschluessel = fetched_at, keine cache-ttl-annahme).
@@ -2804,9 +2881,9 @@ fn escape_label(s: &str) -> String {
     out
 }
 
-/// Fuehrt die CH-Query fuer den 24h-Latenz-Snapshot aus und rendert die
+/// Fuehrt die CH-Query fuer die 24h-Latenz-Sektion aus und rendert die
 /// dazugehoerigen Prometheus-Textzeilen. Err bei Query-Fehler.
-pub async fn build_metrics_snapshot_body(state: &AppState) -> Result<String, String> {
+pub async fn build_latency_body(state: &AppState) -> Result<String, String> {
     let sql = r#"
         SELECT
             count() AS n,
@@ -2870,6 +2947,397 @@ pub async fn build_metrics_snapshot_body(state: &AppState) -> Result<String, Str
     }
 
     Ok(body)
+}
+
+/// Eine Provider-Gruppe der 60s-Live-Sektion (Werte bereits in Sekunden bzw.
+/// Token/s; die ms->s-Konvertierung passiert in der CH-Query).
+#[derive(Debug, Clone)]
+pub struct LiveGroup {
+    pub provider: String,
+    pub provider_name: String,
+    pub reqs: u64,
+    pub errors: u64,
+    pub cost_usd: f64,
+    /// Durchschnittliches TTFT in Sekunden (None = kein First-Byte-Datum im Fenster).
+    pub avg_ttft_s: Option<f64>,
+    /// p50/p95 der Gesamtdauer in Sekunden (deterministische Quantile).
+    pub p50_s: f64,
+    pub p95_s: f64,
+    /// Decode- bzw. Prefill-Rate in Token/s (1h-Lookback, nur Streaming; None ohne Daten).
+    pub decode_tps: Option<f64>,
+    pub prefill_tps: Option<f64>,
+}
+
+/// Ein Provider mit Upstream-Engine-Metriken (Rohwerte aus dessen /metrics-Endpoint).
+#[derive(Debug, Clone)]
+pub struct UpstreamGroup {
+    pub provider: String,
+    pub provider_name: String,
+    /// Anzahl wartender Requests laut Engine-Report.
+    pub queued: Option<f64>,
+    /// Anzahl laufender Requests laut Engine-Report.
+    pub running: Option<f64>,
+    /// KV-Cache-Auslastung (Rohwert, Summe ueber alle Label-Serien, d.h.
+    /// Ranks/Instanzen) — vllm:kv_cache_usage_perc / sglang:token_usage;
+    /// kann > 1 sein (kein Clamp, wie im Dashboard).
+    pub kv_cache_usage: Option<f64>,
+    /// true = der /metrics-Fetch war erfolgreich (2xx + Prometheus-Format),
+    /// sonst false (auch bei fehlender metrics_url, Timeout oder
+    /// nicht-Prometheus-Body).
+    pub fetch_ok: bool,
+}
+
+/// Rendert die 60s-Live-Metriken (Gauges) pro Provider-Gruppe.
+/// Leere Eingabe -> leerer Body (Serien verschwinden, Prometheus-Staleness).
+pub fn render_live_exposition(groups: &[LiveGroup]) -> String {
+    let mut body = String::new();
+    if groups.is_empty() {
+        return body;
+    }
+
+    body.push_str(
+        "# HELP yalr_live_requests LLM requests in the trailing 60s window (snapshot refreshed every 30s). Not cumulative; see yalr_requests_total for the since-process-start counter.\n",
+    );
+    body.push_str("# TYPE yalr_live_requests gauge\n");
+    for g in groups {
+        body.push_str(&format!(
+            "yalr_live_requests{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+            escape_label(&g.provider),
+            escape_label(&g.provider_name),
+            g.reqs
+        ));
+    }
+
+    body.push_str(
+        "# HELP yalr_live_errors Failed LLM requests (status >= 400) in the trailing 60s window (snapshot refreshed every 30s)\n",
+    );
+    body.push_str("# TYPE yalr_live_errors gauge\n");
+    for g in groups {
+        body.push_str(&format!(
+            "yalr_live_errors{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+            escape_label(&g.provider),
+            escape_label(&g.provider_name),
+            g.errors
+        ));
+    }
+
+    body.push_str(
+        "# HELP yalr_live_cost_usd Cost in USD in the trailing 60s window (snapshot refreshed every 30s)\n",
+    );
+    body.push_str("# TYPE yalr_live_cost_usd gauge\n");
+    for g in groups {
+        body.push_str(&format!(
+            "yalr_live_cost_usd{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+            escape_label(&g.provider),
+            escape_label(&g.provider_name),
+            fmt_f64(g.cost_usd)
+        ));
+    }
+
+    body.push_str(
+        "# HELP yalr_live_duration_seconds Request duration in seconds in the trailing 60s window (deterministic quantile, snapshot refreshed every 30s)\n",
+    );
+    body.push_str("# TYPE yalr_live_duration_seconds gauge\n");
+    for g in groups {
+        body.push_str(&format!(
+            "yalr_live_duration_seconds{{provider=\"{}\", provider_name=\"{}\", quantile=\"0.5\"}} {}\n",
+            escape_label(&g.provider),
+            escape_label(&g.provider_name),
+            fmt_f64(g.p50_s)
+        ));
+        body.push_str(&format!(
+            "yalr_live_duration_seconds{{provider=\"{}\", provider_name=\"{}\", quantile=\"0.95\"}} {}\n",
+            escape_label(&g.provider),
+            escape_label(&g.provider_name),
+            fmt_f64(g.p95_s)
+        ));
+    }
+
+    body.push_str(
+        "# HELP yalr_live_first_byte_seconds Average time to first byte in seconds in the trailing 60s window (snapshot refreshed every 30s)\n",
+    );
+    body.push_str("# TYPE yalr_live_first_byte_seconds gauge\n");
+    for g in groups {
+        if let Some(v) = g.avg_ttft_s {
+            body.push_str(&format!(
+                "yalr_live_first_byte_seconds{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+                escape_label(&g.provider),
+                escape_label(&g.provider_name),
+                fmt_f64(v)
+            ));
+        }
+    }
+
+    body.push_str(
+        "# HELP yalr_live_decode_tps Decode rate in tokens per second (1h lookback, streaming requests only, like the dashboard live view)\n",
+    );
+    body.push_str("# TYPE yalr_live_decode_tps gauge\n");
+    for g in groups {
+        if let Some(v) = g.decode_tps {
+            body.push_str(&format!(
+                "yalr_live_decode_tps{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+                escape_label(&g.provider),
+                escape_label(&g.provider_name),
+                fmt_f64(v)
+            ));
+        }
+    }
+
+    body.push_str(
+        "# HELP yalr_live_prefill_tps Prefill rate in tokens per second (1h lookback, streaming requests only, like the dashboard live view)\n",
+    );
+    body.push_str("# TYPE yalr_live_prefill_tps gauge\n");
+    for g in groups {
+        if let Some(v) = g.prefill_tps {
+            body.push_str(&format!(
+                "yalr_live_prefill_tps{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+                escape_label(&g.provider),
+                escape_label(&g.provider_name),
+                fmt_f64(v)
+            ));
+        }
+    }
+
+    body
+}
+
+/// Rendert die Upstream-Engine-Metriken pro Provider.
+/// Bei bekannter, aber leerer Provider-Liste werden trotzdem die
+/// HELP/TYPE-Header und yalr_providers_enabled 0 gerendert (Datenzeilen der
+/// anderen Familien bleiben absent). Fehlende Einzelwerte (None) werden
+/// nicht gerendert (keine NaN-Zeilen).
+pub fn render_upstream_exposition(groups: &[UpstreamGroup], providers_enabled: usize) -> String {
+    let mut body = String::new();
+
+    body.push_str(
+        "# HELP yalr_upstream_queued Queued requests reported by the provider engine (snapshot refreshed every 30s)\n",
+    );
+    body.push_str("# TYPE yalr_upstream_queued gauge\n");
+    for g in groups {
+        if let Some(v) = g.queued {
+            body.push_str(&format!(
+                "yalr_upstream_queued{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+                escape_label(&g.provider),
+                escape_label(&g.provider_name),
+                fmt_f64(v)
+            ));
+        }
+    }
+
+    body.push_str(
+        "# HELP yalr_upstream_running Running requests reported by the provider engine (snapshot refreshed every 30s)\n",
+    );
+    body.push_str("# TYPE yalr_upstream_running gauge\n");
+    for g in groups {
+        if let Some(v) = g.running {
+            body.push_str(&format!(
+                "yalr_upstream_running{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+                escape_label(&g.provider),
+                escape_label(&g.provider_name),
+                fmt_f64(v)
+            ));
+        }
+    }
+
+    body.push_str(
+        "# HELP yalr_upstream_kv_cache_usage KV-cache usage reported by the provider engine (vllm:kv_cache_usage_perc or sglang:token_usage); raw value, summed over all labeled series (ranks/instances), may exceed 1 (snapshot refreshed every 30s)\n",
+    );
+    body.push_str("# TYPE yalr_upstream_kv_cache_usage gauge\n");
+    for g in groups {
+        if let Some(v) = g.kv_cache_usage {
+            body.push_str(&format!(
+                "yalr_upstream_kv_cache_usage{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+                escape_label(&g.provider),
+                escape_label(&g.provider_name),
+                fmt_f64(v)
+            ));
+        }
+    }
+
+    body.push_str(
+        "# HELP yalr_upstream_up Whether the provider /metrics endpoint was reachable on the last fetch (1=up, 0=down or no metrics_url configured)\n",
+    );
+    body.push_str("# TYPE yalr_upstream_up gauge\n");
+    for g in groups {
+        body.push_str(&format!(
+            "yalr_upstream_up{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+            escape_label(&g.provider),
+            escape_label(&g.provider_name),
+            if g.fetch_ok { 1 } else { 0 }
+        ));
+    }
+
+    body.push_str("# HELP yalr_providers_enabled Number of enabled providers\n");
+    body.push_str("# TYPE yalr_providers_enabled gauge\n");
+    body.push_str(&format!("yalr_providers_enabled {}\n", providers_enabled));
+
+    body
+}
+
+/// Rendert die aktuell in-flight laufenden Requests pro (provider, provider_name).
+/// Wird on-demand im metrics_handler gerendert (scrape-aktuell, kein Snapshot).
+pub fn render_in_flight_exposition(in_flight: &[ingest::InFlightReq]) -> String {
+    let mut counts: std::collections::BTreeMap<(String, String), u64> =
+        std::collections::BTreeMap::new();
+    for r in in_flight {
+        *counts
+            .entry((r.provider.clone(), r.provider_name.clone()))
+            .or_insert(0) += 1;
+    }
+
+    let mut body = String::new();
+    body.push_str(
+        "# HELP yalr_in_flight_requests Currently in-flight (running) LLM requests per provider\n",
+    );
+    body.push_str("# TYPE yalr_in_flight_requests gauge\n");
+    for ((provider, provider_name), n) in &counts {
+        body.push_str(&format!(
+            "yalr_in_flight_requests{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+            escape_label(provider),
+            escape_label(provider_name),
+            n
+        ));
+    }
+    body
+}
+
+/// Fuehrt die CH-Queries fuer die 60s-Live-Sektion aus und rendert die
+/// Prometheus-Textzeilen. Schema wie live_stats, aber OHNE Rename-Merge,
+/// key_name-Filter und null-rows-Union. Err bei Query-Fehler.
+pub async fn build_live_body(state: &AppState) -> Result<String, String> {
+    let sql = r#"
+        SELECT
+            provider,
+            provider_name,
+            count() AS reqs,
+            countIf(status >= 400) AS errors,
+            avg(nullIf(first_byte_ms, 0)) / 1000 AS avg_ttft_s,
+            quantileDeterministic(0.5)(duration_ms, cityHash64(request_id)) / 1000 AS p50_s,
+            quantileDeterministic(0.95)(duration_ms, cityHash64(request_id)) / 1000 AS p95_s,
+            sum(cost_usd) AS cost_usd
+        FROM yalr.request_logs
+        WHERE timestamp >= now() - INTERVAL 60 SECOND
+        GROUP BY provider, provider_name
+        ORDER BY reqs DESC
+    "#;
+
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct LiveRow {
+        provider: String,
+        provider_name: String,
+        reqs: u64,
+        errors: u64,
+        avg_ttft_s: Option<f64>,
+        p50_s: f64,
+        p95_s: f64,
+        cost_usd: f64,
+    }
+
+    let rows = state
+        .ch
+        .query(sql)
+        .fetch_all::<LiveRow>()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 1h-Lookback fuer decode/prefill-TPS pro (provider, provider_name),
+    // identische Guard-Klauseln wie in live_stats.
+    let rate_sql = r#"
+        SELECT
+            provider,
+            provider_name,
+            sumIf(completion_tokens, is_stream = 1 AND completion_tokens > 0 AND duration_ms > first_byte_ms AND status < 400) AS completion_sum,
+            sumIf(duration_ms - first_byte_ms, is_stream = 1 AND completion_tokens > 0 AND duration_ms > first_byte_ms AND status < 400) AS decode_ms_sum,
+            sumIf(prompt_tokens, is_stream = 1 AND prompt_tokens > 0 AND first_byte_ms > 0 AND status < 400) AS prompt_sum,
+            sumIf(first_byte_ms, is_stream = 1 AND prompt_tokens > 0 AND first_byte_ms > 0 AND status < 400) AS prefill_ms_sum
+        FROM yalr.request_logs
+        WHERE timestamp >= now() - INTERVAL 3600 SECOND
+        GROUP BY provider, provider_name
+    "#;
+
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct LiveRateRow {
+        provider: String,
+        provider_name: String,
+        completion_sum: u64,
+        decode_ms_sum: u64,
+        prompt_sum: u64,
+        prefill_ms_sum: u64,
+    }
+
+    let rate_rows = state
+        .ch
+        .query(rate_sql)
+        .fetch_all::<LiveRateRow>()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Rates pro Gruppe via rates_from_sums (bereits Token/s, keine 3600-Division noetig).
+    let rates: std::collections::HashMap<(String, String), (Option<f64>, Option<f64>)> =
+        rate_rows
+            .iter()
+            .map(|r| {
+                let s = RateSums {
+                    completion: r.completion_sum,
+                    decode_ms: r.decode_ms_sum,
+                    prompt: r.prompt_sum,
+                    prefill_ms: r.prefill_ms_sum,
+                };
+                ((r.provider.clone(), r.provider_name.clone()), rates_from_sums(&s))
+            })
+            .collect();
+
+    let groups: Vec<LiveGroup> = rows
+        .into_iter()
+        .map(|r| {
+            let (decode_tps, prefill_tps) = rates
+                .get(&(r.provider.clone(), r.provider_name.clone()))
+                .cloned()
+                .unwrap_or((None, None));
+            LiveGroup {
+                provider: r.provider,
+                provider_name: r.provider_name,
+                reqs: r.reqs,
+                errors: r.errors,
+                cost_usd: r.cost_usd,
+                avg_ttft_s: r.avg_ttft_s,
+                p50_s: r.p50_s,
+                p95_s: r.p95_s,
+                decode_tps,
+                prefill_tps,
+            }
+        })
+        .collect();
+
+    Ok(render_live_exposition(&groups))
+}
+
+/// Baut die Upstream-Sektion aus den Provider-/metrics-Endpunkten (nutzt den
+/// geteilten 2s-Cache). Laedt die enabled Provider direkt aus Postgres und
+/// holt die /metrics-Werte OHNE den Delta-Raten-Pfad von live_stats
+/// (PREV_SAMPLES wird nicht angefasst). Ein PG-Fehler wird als Err
+/// durchgereicht, damit der Task den alten Stand behaelt und nicht "0
+/// Provider" rendert.
+pub async fn build_upstream_body(state: &AppState) -> Result<String, String> {
+    let rows = load_enabled_providers(state).await?;
+    let providers_enabled = rows.len();
+    let (entries, _from_cache) = fetch_and_parse_provider_metrics(state, rows).await;
+
+    let mut groups: Vec<UpstreamGroup> = entries
+        .iter()
+        .map(|(name, e)| UpstreamGroup {
+            provider: e.kind.clone(),
+            provider_name: name.clone(),
+            queued: e.queued,
+            running: e.running,
+            kv_cache_usage: e.kv_cache_usage,
+            fetch_ok: e.fetch_ok,
+        })
+        .collect();
+    // stabile Reihenfolge: alphabetisch absteigend nach provider_name
+    groups.sort_by(|a, b| b.provider_name.cmp(&a.provider_name));
+
+    Ok(render_upstream_exposition(&groups, providers_enabled))
 }
 
 /// Rendert die counter-basierten Metriken (since process start, ohne CH).
@@ -2974,18 +3442,70 @@ pub fn render_snapshot_exposition(snap: &common::state::MetricsSnapshot) -> Stri
         ));
     }
 
-    body.push_str(
-        "# HELP yalr_metrics_snapshot_age_seconds Age of the last successful metrics snapshot in seconds\n",
+    push_age_metric(
+        &mut body,
+        "yalr_metrics_snapshot_age_seconds",
+        "Age of the last successful latency snapshot in seconds",
+        snap.latency_built_at,
     );
-    body.push_str("# TYPE yalr_metrics_snapshot_age_seconds gauge\n");
-    if let Some(built_at) = snap.built_at {
-        let age_s = Utc::now().signed_duration_since(built_at).num_seconds().max(0) as f64;
-        body.push_str(&format!(
-            "yalr_metrics_snapshot_age_seconds {}\n",
-            fmt_f64(age_s)
-        ));
-    }
+    push_age_metric(
+        &mut body,
+        "yalr_live_metrics_age_seconds",
+        "Age of the last successful live-metrics snapshot in seconds",
+        snap.live_built_at,
+    );
+    push_age_metric(
+        &mut body,
+        "yalr_upstream_metrics_age_seconds",
+        "Age of the last successful upstream-metrics snapshot in seconds",
+        snap.upstream_built_at,
+    );
 
+    body
+}
+
+/// Hängt HELP/TYPE + (falls vorhanden) die Age-Wertzeile einer
+/// Snapshot-Metrik an (Dedup der drei Age-Blöcke).
+fn push_age_metric(body: &mut String, metric: &str, help: &str, built_at: Option<DateTime<Utc>>) {
+    body.push_str(&format!("# HELP {metric} {help}\n"));
+    body.push_str(&format!("# TYPE {metric} gauge\n"));
+    if let Some(built_at) = built_at {
+        let age_s = Utc::now().signed_duration_since(built_at).num_seconds().max(0) as f64;
+        body.push_str(&format!("{metric} {}\n", fmt_f64(age_s)));
+    }
+}
+
+/// Konkatentiert die /metrics-Sektionen in fester Reihenfolge (reine
+/// Funktion, testbar): Latenz (24h), Live (60s), Upstream, Snapshot-
+/// Metadaten, In-Flight, kumulative Counter.
+pub fn compose_metrics_body(
+    latency: &str,
+    live: &str,
+    upstream: &str,
+    snapshot: &str,
+    in_flight: &str,
+    counters: &str,
+) -> String {
+    let mut body = String::with_capacity(
+        latency
+            .len()
+            + live
+            .len()
+            + upstream
+            .len()
+            + snapshot
+            .len()
+            + in_flight
+            .len()
+            + counters
+            .len(),
+    );
+    body.push_str(latency);
+    body.push_str(live);
+    body.push_str(upstream);
+    body.push_str(snapshot);
+    body.push_str(in_flight);
+    body.push_str(counters);
     body
 }
 
@@ -3018,11 +3538,21 @@ pub async fn metrics_handler(State(state): State<AppState>, headers: HeaderMap) 
 
     let (entries, auth_failures) = state.log_sink.snapshot_counters();
     let dropped = state.log_sink.dropped_count();
+    let in_flight = state.log_sink.in_flight_snapshot();
 
     let snapshot_part = render_snapshot_exposition(&snap);
-    let mut body = snap.exposition_body;
-    body.push_str(&snapshot_part);
-    body.push_str(&render_counter_exposition(&entries, auth_failures, dropped));
+    let in_flight_part = render_in_flight_exposition(&in_flight);
+    let counter_part = render_counter_exposition(&entries, auth_failures, dropped);
+    // Sektionen in fester Reihenfolge: Latenz (24h), Live (60s), Upstream,
+    // Snapshot-Metadaten, on-demand In-Flight, kumulative Counter.
+    let body = compose_metrics_body(
+        &snap.latency_body,
+        &snap.live_body,
+        &snap.upstream_body,
+        &snapshot_part,
+        &in_flight_part,
+        &counter_part,
+    );
 
     (
         StatusCode::OK,
@@ -3155,21 +3685,223 @@ mod metrics_tests {
         assert!(!body.contains("yalr_clickhouse_up 0"));
         assert!(!body.contains("yalr_clickhouse_up 1"));
         assert!(!body.contains("yalr_metrics_snapshot_age_seconds 0"));
+        assert!(!body.contains("yalr_live_metrics_age_seconds 0"));
+        assert!(!body.contains("yalr_upstream_metrics_age_seconds 0"));
 
         let mut snap = snap;
-        snap.exposition_body = String::new();
         snap.clickhouse_up = Some(true);
-        snap.built_at = Some(Utc::now());
+        snap.latency_built_at = Some(Utc::now());
+        snap.live_built_at = Some(Utc::now());
+        snap.upstream_built_at = Some(Utc::now());
         let body = super::render_snapshot_exposition(&snap);
         assert!(body.contains("yalr_clickhouse_up 1"));
         assert!(body.contains("yalr_metrics_snapshot_age_seconds "));
+        assert!(body.contains("yalr_live_metrics_age_seconds "));
+        assert!(body.contains("yalr_upstream_metrics_age_seconds "));
 
         snap.clickhouse_up = Some(false);
-        snap.built_at = None;
+        snap.latency_built_at = None;
+        snap.live_built_at = None;
+        snap.upstream_built_at = None;
         let body = super::render_snapshot_exposition(&snap);
         assert!(body.contains("yalr_clickhouse_up 0"));
-        // ohne built_at: keine Age-Zeile
+        // ohne built_at: keine Age-Zeilen
         assert!(!body.contains("yalr_metrics_snapshot_age_seconds 0"));
+        assert!(!body.contains("yalr_live_metrics_age_seconds 0"));
+        assert!(!body.contains("yalr_upstream_metrics_age_seconds 0"));
+    }
+
+    #[test]
+    fn test_render_live_exposition_normal() {
+        let groups = vec![super::LiveGroup {
+            provider: "openai_compat".into(),
+            provider_name: "DGX 1".into(),
+            reqs: 10,
+            errors: 2,
+            cost_usd: 1.234567,
+            // Werte kommen bereits in Sekunden aus der Query (ms / 1000)
+            avg_ttft_s: Some(0.5),
+            p50_s: 1.0,
+            p95_s: 2.25,
+            decode_tps: Some(120.5),
+            prefill_tps: Some(480.25),
+        }];
+        let body = super::render_live_exposition(&groups);
+        assert!(body.contains("# TYPE yalr_live_requests gauge"));
+        assert!(body.contains("yalr_live_requests{provider=\"openai_compat\", provider_name=\"DGX 1\"} 10"));
+        assert!(body.contains("yalr_live_errors{provider=\"openai_compat\", provider_name=\"DGX 1\"} 2"));
+        assert!(body.contains("yalr_live_cost_usd{provider=\"openai_compat\", provider_name=\"DGX 1\"} 1.234567"));
+        // quantile-Labels + Werte in Sekunden (ms->s in der Query)
+        assert!(body.contains("yalr_live_duration_seconds{provider=\"openai_compat\", provider_name=\"DGX 1\", quantile=\"0.5\"} 1"));
+        assert!(body.contains("yalr_live_duration_seconds{provider=\"openai_compat\", provider_name=\"DGX 1\", quantile=\"0.95\"} 2.25"));
+        assert!(body.contains("yalr_live_first_byte_seconds{provider=\"openai_compat\", provider_name=\"DGX 1\"} 0.5"));
+        assert!(body.contains("yalr_live_decode_tps{provider=\"openai_compat\", provider_name=\"DGX 1\"} 120.5"));
+        assert!(body.contains("yalr_live_prefill_tps{provider=\"openai_compat\", provider_name=\"DGX 1\"} 480.25"));
+    }
+
+    #[test]
+    fn test_render_live_exposition_empty() {
+        // Leere Eingabe -> leerer Body (Prometheus-Staleness, Serien verschwinden)
+        assert_eq!(super::render_live_exposition(&[]), "");
+    }
+
+    #[test]
+    fn test_render_live_exposition_escaping_and_none() {
+        let groups = vec![super::LiveGroup {
+            provider: "p\n\"x\"".into(),
+            provider_name: "N".into(),
+            reqs: 1,
+            errors: 0,
+            cost_usd: 0.0,
+            avg_ttft_s: None,
+            p50_s: 0.0,
+            p95_s: 0.0,
+            decode_tps: None,
+            prefill_tps: None,
+        }];
+        let body = super::render_live_exposition(&groups);
+        // Label-Escaping: \n und \"
+        assert!(body.contains(r##"provider="p\n\"x\""##));
+        assert!(!body.contains("p\n\"x\""));
+        // cost 0.0 -> "0" (fmt_f64 trimmt trailing Zeros)
+        assert!(body.contains("yalr_live_cost_usd{provider=\"p\\n\\\"x\\\"\", provider_name=\"N\"} 0"));
+        // None-Werte: keine Daten-Zeilen, aber HELP/TYPE vorhanden
+        assert!(!body.contains("yalr_live_first_byte_seconds{"));
+        assert!(!body.contains("yalr_live_decode_tps{"));
+        assert!(!body.contains("yalr_live_prefill_tps{"));
+        assert!(body.contains("# TYPE yalr_live_first_byte_seconds gauge"));
+    }
+
+    #[test]
+    fn test_render_upstream_exposition_normal() {
+        let groups = vec![
+            super::UpstreamGroup {
+                provider: "vllm".into(),
+                provider_name: "DGX \"A\"".into(),
+                queued: Some(3.0),
+                running: Some(2.0),
+                kv_cache_usage: Some(0.85),
+                fetch_ok: true,
+            },
+            super::UpstreamGroup {
+                provider: "openai_compat".into(),
+                provider_name: "OpenAI".into(),
+                queued: None,
+                running: None,
+                kv_cache_usage: None,
+                fetch_ok: false,
+            },
+        ];
+        let body = super::render_upstream_exposition(&groups, 5);
+        assert!(body.contains("yalr_upstream_queued{provider=\"vllm\", provider_name=\"DGX \\\"A\\\"\"} 3"));
+        assert!(body.contains("yalr_upstream_running{provider=\"vllm\", provider_name=\"DGX \\\"A\\\"\"} 2"));
+        assert!(body.contains("yalr_upstream_kv_cache_usage{provider=\"vllm\", provider_name=\"DGX \\\"A\\\"\"} 0.85"));
+        assert!(body.contains("yalr_upstream_up{provider=\"vllm\", provider_name=\"DGX \\\"A\\\"\"} 1"));
+        assert!(body.contains("yalr_upstream_up{provider=\"openai_compat\", provider_name=\"OpenAI\"} 0"));
+        // fehlende Werte (None) werden nicht gerendert, nie NaN
+        assert!(!body.contains("yalr_upstream_queued{provider=\"openai_compat\""));
+        assert!(!body.contains("NaN"));
+        assert!(body.contains("yalr_providers_enabled 5"));
+    }
+
+    #[test]
+    fn test_render_upstream_exposition_empty() {
+        // Bekannte, aber leere Provider-Liste: Header + providers_enabled 0,
+        // Datenzeilen der anderen Familien bleiben absent.
+        let body = super::render_upstream_exposition(&[], 0);
+        assert!(body.contains("# HELP yalr_providers_enabled"));
+        assert!(body.contains("# TYPE yalr_providers_enabled gauge"));
+        assert!(body.contains("yalr_providers_enabled 0"));
+        assert!(body.contains("# TYPE yalr_upstream_queued gauge"));
+        assert!(body.contains("# TYPE yalr_upstream_running gauge"));
+        assert!(body.contains("# TYPE yalr_upstream_kv_cache_usage gauge"));
+        assert!(body.contains("# TYPE yalr_upstream_up gauge"));
+        assert!(!body.contains("yalr_upstream_queued{"));
+        assert!(!body.contains("yalr_upstream_running{"));
+        assert!(!body.contains("yalr_upstream_kv_cache_usage{"));
+        assert!(!body.contains("yalr_upstream_up{"));
+    }
+
+    #[test]
+    fn test_render_upstream_exposition_providers_enabled_mismatch() {
+        // providers_enabled kommt aus der DB, nicht aus der Gruppen-Liste:
+        // Provider ohne metrics_url taucht in yalr_upstream_up auf (0), nicht
+        // in queued/running; enabled-Zaehl bleibt 2.
+        let groups = vec![super::UpstreamGroup {
+            provider: "openai_compat".into(),
+            provider_name: "NoUrl".into(),
+            queued: None,
+            running: None,
+            kv_cache_usage: None,
+            fetch_ok: false,
+        }];
+        let body = super::render_upstream_exposition(&groups, 2);
+        assert!(body.contains("yalr_providers_enabled 2"));
+        assert!(body.contains("yalr_upstream_up{provider=\"openai_compat\", provider_name=\"NoUrl\"} 0"));
+    }
+
+    #[test]
+    fn test_render_in_flight_exposition() {
+        let mk = |id: &str, prov: &str, name: &str| ingest::InFlightReq {
+            request_id: id.into(),
+            provider: prov.into(),
+            provider_name: name.into(),
+            model: "m".into(),
+            key_name: "k".into(),
+            started_at_ms: 0,
+            first_byte_ms: None,
+        };
+        let in_flight = vec![
+            mk("a", "p1", "N1"),
+            mk("b", "p1", "N1"),
+            mk("c", "p2", "N2"),
+            // Label-Werte, die Escaping erfordern (\n und ")
+            mk("d", "p\n3", "N\"4"),
+        ];
+        let body = super::render_in_flight_exposition(&in_flight);
+        // pro (provider, provider_name) gezählt
+        assert!(body.contains("yalr_in_flight_requests{provider=\"p1\", provider_name=\"N1\"} 2"));
+        assert!(body.contains("yalr_in_flight_requests{provider=\"p2\", provider_name=\"N2\"} 1"));
+        // Label-Escaping: \n und " werden escaped, rohe Werte tauchen nie auf
+        assert!(body.contains(r##"yalr_in_flight_requests{provider="p\n3", provider_name="N\"4"} 1"##));
+        assert!(!body.contains("p\n3"));
+        assert!(!body.contains("N\"4"));
+
+        // leer: Header vorhanden, keine Daten-Zeilen
+        let body = super::render_in_flight_exposition(&[]);
+        assert!(body.contains("# TYPE yalr_in_flight_requests gauge"));
+        assert!(!body.contains("yalr_in_flight_requests{"));
+    }
+
+    #[test]
+    fn test_compose_metrics_body_order_and_empty_sections() {
+        let body = super::compose_metrics_body(
+            "yalr_request_duration_seconds{quantile=\"0.5\"} 1\n",
+            "yalr_live_requests{provider=\"p\"} 2\n",
+            "yalr_upstream_up{provider=\"p\"} 1\n",
+            "yalr_clickhouse_up 1\n",
+            "yalr_in_flight_requests{provider=\"p\"} 3\n",
+            "yalr_requests_total 4\n",
+        );
+        // alle Sektionen vorhanden
+        assert!(body.contains("yalr_request_duration_seconds{quantile=\"0.5\"} 1"));
+        assert!(body.contains("yalr_live_requests{provider=\"p\"} 2"));
+        assert!(body.contains("yalr_upstream_up{provider=\"p\"} 1"));
+        assert!(body.contains("yalr_clickhouse_up 1"));
+        assert!(body.contains("yalr_in_flight_requests{provider=\"p\"} 3"));
+        assert!(body.contains("yalr_requests_total 4"));
+        // feste Reihenfolge: Latenz < Live < Upstream < Snapshot < In-Flight < Counter
+        let pos = |s: &str| body.find(s).expect("Sektion fehlt");
+        assert!(pos("yalr_request_duration_seconds") < pos("yalr_live_requests"));
+        assert!(pos("yalr_live_requests") < pos("yalr_upstream_up"));
+        assert!(pos("yalr_upstream_up") < pos("yalr_clickhouse_up"));
+        assert!(pos("yalr_clickhouse_up") < pos("yalr_in_flight_requests"));
+        assert!(pos("yalr_in_flight_requests") < pos("yalr_requests_total"));
+
+        // leere Sektionen: Rest unveraendert in richtiger Reihenfolge
+        let body =
+            super::compose_metrics_body("", "", "", "yalr_clickhouse_up 1\n", "", "yalr_requests_total 4\n");
+        assert_eq!(body, "yalr_clickhouse_up 1\nyalr_requests_total 4\n");
     }
 
     #[test]
