@@ -1,0 +1,97 @@
+services:
+  yalr:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-please}
+      SESSION_SECRET: ${SESSION_SECRET:-please-generate-a-long-random-string}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: yalr
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-yalr-secret}
+      POSTGRES_DB: yalr
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse-secret}
+      CLICKHOUSE_DB: yalr
+      LOG_BODY_MAX_LEN: ${LOG_BODY_MAX_LEN:-32768}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 1g
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: yalr
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-yalr-secret}
+      POSTGRES_DB: yalr
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yalr"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 512m
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    environment:
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse-secret}
+    volumes:
+      - chdata:/var/lib/clickhouse
+      - ./clickhouse-config:/etc/clickhouse-server/config.d:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 2g
+    cpus: 2
+
+  edge:
+    image: caddy:2-alpine
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - yalr
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 128m
+
+volumes:
+  pgdata:
+  chdata:

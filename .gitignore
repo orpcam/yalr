@@ -1,0 +1,28 @@
+# Rust
+target/
+
+# Node
+node_modules/
+dist/
+
+# Vite/tsc build artifacts
+*.tsbuildinfo
+
+# Environment (never commit secrets)
+.env
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Local docs (never commit)
+PLAN.md
+AGENTS.md
+DEPLOY.md

@@ -1,0 +1,23 @@
+# Edge proxy (Caddy) — YALR
+# Port publishing in docker-compose.yml binds 127.0.0.1:8081; the container
+# listens on 0.0.0.0:8081 here (the loopback restriction comes from the publish).
+# Purpose: only the allowed API paths are proxied to the YALR backend
+# outwards; all other paths -> 404.
+# reverse_proxy streams SSE unbuffered (Caddy default) — do not change.
+
+:8081 {
+	# Allowed API paths: gateway API (/v1/*), health and metrics checks.
+	@api {
+		path /v1/* /health /metrics
+	}
+
+	# Forward only the allowed paths to YALR.
+	handle @api {
+		reverse_proxy yalr:8080
+	}
+
+	# Everything else (e.g. dashboard, /dashboard-api, /) -> 404.
+	handle {
+		respond 404
+	}
+}

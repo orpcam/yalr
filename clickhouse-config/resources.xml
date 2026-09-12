@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<clickhouse>
+    <!-- Cap on the server's main memory usage (~1.5 GiB), intentionally
+         below the cgroup limit (mem_limit: 2g in docker-compose.yml) so that
+         ClickHouse's internal monitoring kicks in before cgroup-OOM kills the server. -->
+    <max_server_memory_usage>1600000000</max_server_memory_usage>
+</clickhouse>

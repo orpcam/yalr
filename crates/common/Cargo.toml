@@ -1,0 +1,22 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+sqlx = { workspace = true }
+serde_json = { workspace = true }
+clickhouse = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+ingest = { path = "../ingest" }
+providers = { path = "../providers" }
