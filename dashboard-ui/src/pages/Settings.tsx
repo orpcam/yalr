@@ -41,7 +41,7 @@ export default function Settings() {
         </CardHeader>
         <CardContent>
           <Select
-            className="w-44"
+            className="w-full sm:w-44"
             value={language}
             onChange={(e) => setLanguage(e.target.value as typeof language)}
           >
@@ -61,7 +61,7 @@ export default function Settings() {
         <CardContent className="space-y-3">
           <p className="text-sm text-muted-foreground">{t("currency_description")}</p>
           <Select
-            className="w-44"
+            className="w-full sm:w-44"
             value={currency}
             onChange={(e) => setCurrency(e.target.value as typeof currency)}
           >

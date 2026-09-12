@@ -2,6 +2,8 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "path";
 
+const apiTarget = process.env.VITE_API_TARGET ?? "http://localhost:8080";
+
 export default defineConfig({
   plugins: [react()],
   resolve: {
@@ -13,9 +15,11 @@ export default defineConfig({
     outDir: "dist",
   },
   server: {
+    // tailscale serve leitet mit dem ts.net-Hostnamen weiter
+    allowedHosts: true,
     proxy: {
-      "/dashboard-api": "http://localhost:8080",
-      "/v1": "http://localhost:8080",
+      "/dashboard-api": apiTarget,
+      "/v1": apiTarget,
     },
   },
 });

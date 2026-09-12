@@ -166,15 +166,15 @@ export function ProvidersSection({ providers, refresh }: Props) {
         <CardTitle>{t("provider")}</CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
-        <form onSubmit={createProvider} className="flex flex-wrap items-end gap-4">
+        <form onSubmit={createProvider} className="flex flex-wrap items-center gap-2 sm:items-end sm:gap-4">
           <div className="space-y-2">
             <Label>{t("name")}</Label>
-            <Input className="w-44" placeholder="openai-main" value={pName} onChange={(e) => setPName(e.target.value)} required />
+            <Input className="w-full sm:w-44" placeholder="openai-main" value={pName} onChange={(e) => setPName(e.target.value)} required />
           </div>
-          <div className="space-y-2">
+          <div className="w-full space-y-2 sm:w-auto">
             <Label>{t("type")}</Label>
             <Select
-              className="w-40"
+              className="w-full sm:w-40"
               value={pKind}
               onChange={(e) => {
                 setPKind(e.target.value);
@@ -190,16 +190,16 @@ export function ProvidersSection({ providers, refresh }: Props) {
           </div>
           <div className="space-y-2">
             <Label>{t("base_url")}</Label>
-            <Input className="w-72" value={pBaseUrl} onChange={(e) => setPBaseUrl(e.target.value)} required />
+            <Input className="w-full sm:w-72" value={pBaseUrl} onChange={(e) => setPBaseUrl(e.target.value)} required />
           </div>
           <div className="space-y-2">
             <Label>{t("api_key")}</Label>
-            <Input className="w-56" type="password" value={pApiKey} onChange={(e) => setPApiKey(e.target.value)} required />
+            <Input className="w-full sm:w-56" type="password" value={pApiKey} onChange={(e) => setPApiKey(e.target.value)} required />
           </div>
           <div className="space-y-2">
             <Label>{t("metrics_url")}</Label>
-            <div className="flex items-center gap-2">
-              <Input className="w-64" type="url" placeholder="http://host:port/metrics" value={pMetricsUrl} onChange={(e) => setPMetricsUrl(e.target.value)} />
+            <div className="flex flex-wrap items-center gap-2">
+              <Input className="w-full sm:w-64" type="url" placeholder="http://host:port/metrics" value={pMetricsUrl} onChange={(e) => setPMetricsUrl(e.target.value)} />
               <Button type="button" variant="outline" size="sm" onClick={discoverMetrics} title={t("discover_metrics_hint")}>
                 {t("discover_metrics")}
               </Button>
@@ -210,7 +210,7 @@ export function ProvidersSection({ providers, refresh }: Props) {
 
         {error && <p className="text-sm text-destructive">{error}</p>}
 
-        <Table>
+        <Table className="min-w-[640px] md:min-w-0">
           <TableHeader>
             <TableRow>
               <TableHead>{t("name")}</TableHead>
@@ -235,12 +235,12 @@ export function ProvidersSection({ providers, refresh }: Props) {
                     <div className="space-y-2">
                       <div className="flex flex-wrap items-center gap-2">
                         <Input
-                          className="h-7 w-44 px-2 py-0.5 text-xs"
+                          className="h-7 w-full sm:w-44 px-2 py-0.5 text-xs"
                           value={editProv.name}
                           onChange={(e) => setEditProv((s) => ({ ...s, name: e.target.value }))}
                         />
                         <Select
-                          className="h-7 w-32 px-2 py-0.5 text-xs"
+                          className="h-7 w-full sm:w-32 px-2 py-0.5 text-xs"
                           value={editProv.kind}
                           onChange={(e) => setEditProv((s) => ({ ...s, kind: e.target.value }))}
                         >
@@ -263,7 +263,7 @@ export function ProvidersSection({ providers, refresh }: Props) {
                         onChange={(e) => setEditProv((s) => ({ ...s, metrics_url: e.target.value }))}
                       />
                       <Input
-                        className="h-7 w-64 px-2 py-0.5 text-xs"
+                        className="h-7 w-full sm:w-64 px-2 py-0.5 text-xs"
                         type="password"
                         placeholder={t("api_key_unchanged")}
                         value={editProv.api_key}
@@ -280,7 +280,7 @@ export function ProvidersSection({ providers, refresh }: Props) {
                     </div>
                   </TableCell>
                   <TableCell className="text-right">
-                    <div className="flex justify-end gap-2">
+                    <div className="flex justify-end gap-2 whitespace-nowrap">
                       <Button variant="outline" size="sm" onClick={() => setEditingProviderId(null)}>
                         {t("cancel")}
                       </Button>
@@ -302,7 +302,7 @@ export function ProvidersSection({ providers, refresh }: Props) {
                   <TableCell className="text-muted-foreground">{p.base_url}</TableCell>
                   <TableCell className="text-muted-foreground">{p.metrics_url || "—"}</TableCell>
                   <TableCell className="text-right">
-                    <div className="flex justify-end gap-2">
+                    <div className="flex justify-end gap-2 whitespace-nowrap">
                       <Button variant="outline" size="sm" onClick={() => startEditProvider(p)}>
                         {t("edit")}
                       </Button>

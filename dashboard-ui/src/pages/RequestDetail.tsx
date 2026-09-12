@@ -44,7 +44,7 @@ export default function RequestDetail() {
   if (error) {
     return (
       <div className="space-y-4">
-        <div className="flex items-center gap-4">
+        <div className="flex flex-wrap items-center gap-4">
           <Link to="/requests">
             <Button variant="outline">{t("back")}</Button>
           </Link>
@@ -68,7 +68,7 @@ export default function RequestDetail() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center gap-4">
         <Link to="/requests">
           <Button variant="outline">{t("back")}</Button>
         </Link>
@@ -95,7 +95,7 @@ export default function RequestDetail() {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm text-muted-foreground">{t("model")}</CardTitle>
           </CardHeader>
-          <CardContent className="font-medium">
+          <CardContent className="font-medium break-all">
             {log.model}
             {log.upstream_model && log.upstream_model !== log.model && (
               <span className="text-muted-foreground"> → {log.upstream_model}</span>
@@ -147,14 +147,14 @@ export default function RequestDetail() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <pre className="whitespace-pre-wrap text-sm">{log.error_message}</pre>
+            <pre className="whitespace-pre-wrap break-all text-sm">{log.error_message}</pre>
           </CardContent>
         </Card>
       )}
 
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>
-          <CardHeader className="flex flex-row items-center justify-between space-y-0">
+          <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-2 space-y-0">
             <div className="flex items-center gap-2">
               <CardTitle>{t("request_body")}</CardTitle>
               {log.request_truncated && (
@@ -180,14 +180,14 @@ export default function RequestDetail() {
                 {requestText.content || "–"}
               </pre>
             ) : (
-              <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-4 text-xs">
+              <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-4 text-xs">
                 {log.request_body ? prettyJson(log.request_body) : "–"}
               </pre>
             )}
           </CardContent>
         </Card>
         <Card>
-          <CardHeader className="flex flex-row items-center justify-between space-y-0">
+          <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-2 space-y-0">
             <div className="flex items-center gap-2">
               <CardTitle>{t("response_body")}</CardTitle>
               {log.response_truncated && (
@@ -213,20 +213,20 @@ export default function RequestDetail() {
                 {streamText.reasoning && (
                   <div>
                     <p className="mb-1 text-xs font-medium text-muted-foreground">{t("reasoning")}</p>
-                    <pre className="whitespace-pre-wrap font-mono text-xs text-muted-foreground">
+                    <pre className="whitespace-pre-wrap break-all font-mono text-xs text-muted-foreground">
                       {streamText.reasoning}
                     </pre>
                   </div>
                 )}
                 <div>
                   <p className="mb-1 text-xs font-medium text-muted-foreground">{t("response_text")}</p>
-                  <pre className="whitespace-pre-wrap font-mono text-sm">{streamText.content || "–"}</pre>
+                  <pre className="whitespace-pre-wrap break-all font-mono text-sm">{streamText.content || "–"}</pre>
                 </div>
                 {streamText.toolCalls.length > 0 && (
                   <div>
                     <p className="mb-1 text-xs font-medium text-muted-foreground">{t("tool_calls")}</p>
                     {streamText.toolCalls.map((tc, i) => (
-                      <pre key={i} className="whitespace-pre-wrap font-mono text-xs">
+                      <pre key={i} className="whitespace-pre-wrap break-all font-mono text-xs">
                         {tc.name}({tc.arguments})
                       </pre>
                     ))}
@@ -234,7 +234,7 @@ export default function RequestDetail() {
                 )}
               </div>
             ) : (
-              <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-4 text-xs">
+              <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-4 text-xs">
                 {log.response_body ? prettyJson(log.response_body) : "–"}
               </pre>
             )}

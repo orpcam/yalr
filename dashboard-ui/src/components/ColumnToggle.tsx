@@ -35,7 +35,7 @@ export function ColumnToggle({ columns, hidden, onToggle, onReset }: ColumnToggl
       {open && (
         <div
           className={cn(
-            "absolute right-0 z-10 mt-1 min-w-44 rounded-md border border-border",
+            "absolute right-0 z-10 mt-1 min-w-44 max-w-[calc(100vw-2rem)] rounded-md border border-border",
             "bg-card p-1 shadow-md"
           )}
         >

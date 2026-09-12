@@ -146,10 +146,10 @@ export function ModelsSection({ providers, models, refresh }: Props) {
         <CardTitle>{t("model")}</CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
-        <form onSubmit={createModel} className="flex flex-wrap items-end gap-4">
-          <div className="space-y-2">
+        <form onSubmit={createModel} className="flex flex-wrap items-center gap-2 sm:items-end sm:gap-4">
+          <div className="w-full space-y-2 sm:w-auto">
             <Label>{t("provider")}</Label>
-            <Select className="w-44" value={mProviderId} onChange={(e) => setMProviderId(e.target.value)} required>
+            <Select className="w-full sm:w-44" value={mProviderId} onChange={(e) => setMProviderId(e.target.value)} required>
               <option value="">{t("select_placeholder")}</option>
               {providers.map((p) => (
                 <option key={p.id} value={p.id}>
@@ -160,23 +160,23 @@ export function ModelsSection({ providers, models, refresh }: Props) {
           </div>
           <div className="space-y-2">
             <Label>{t("model_name_gateway")}</Label>
-            <Input className="w-44" placeholder="gpt-4o" value={mName} onChange={(e) => setMName(e.target.value)} required />
+            <Input className="w-full sm:w-44" placeholder="gpt-4o" value={mName} onChange={(e) => setMName(e.target.value)} required />
           </div>
           <div className="space-y-2">
             <Label>{t("upstream_model")}</Label>
-            <Input className="w-52" placeholder={t("upstream_placeholder")} value={mUpstream} onChange={(e) => setMUpstream(e.target.value)} />
+            <Input className="w-full sm:w-52" placeholder={t("upstream_placeholder")} value={mUpstream} onChange={(e) => setMUpstream(e.target.value)} />
           </div>
           <div className="space-y-2">
             <Label>{t("input_price")}</Label>
-            <Input className="w-28" type="number" step="0.0001" min="0" value={mInputPrice} onChange={(e) => setMInputPrice(e.target.value)} />
+            <Input className="w-full sm:w-28" type="number" step="0.0001" min="0" value={mInputPrice} onChange={(e) => setMInputPrice(e.target.value)} />
           </div>
           <div className="space-y-2">
             <Label>{t("output_price")}</Label>
-            <Input className="w-28" type="number" step="0.0001" min="0" value={mOutputPrice} onChange={(e) => setMOutputPrice(e.target.value)} />
+            <Input className="w-full sm:w-28" type="number" step="0.0001" min="0" value={mOutputPrice} onChange={(e) => setMOutputPrice(e.target.value)} />
           </div>
           <div className="space-y-2">
             <Label>{t("quantization")}</Label>
-            <Input className="w-28" placeholder="FP8" value={mQuantization} onChange={(e) => setMQuantization(e.target.value)} />
+            <Input className="w-full sm:w-28" placeholder="FP8" value={mQuantization} onChange={(e) => setMQuantization(e.target.value)} />
           </div>
           <div className="space-y-2 grow">
             <Label>{t("notes")}</Label>
@@ -201,7 +201,7 @@ export function ModelsSection({ providers, models, refresh }: Props) {
 
         {error && <p className="text-sm text-destructive">{error}</p>}
 
-        <Table>
+        <Table className="min-w-[768px] md:min-w-0">
           <TableHeader>
             <TableRow>
               <TableHead>{t("model")}</TableHead>
@@ -227,19 +227,19 @@ export function ModelsSection({ providers, models, refresh }: Props) {
                   <TableCell className="font-medium">
                     {m.model_name}
                     <Input
-                      className="mt-1 h-7 w-44 px-2 py-0.5 text-xs"
+                      className="mt-1 h-7 w-full sm:w-44 px-2 py-0.5 text-xs"
                       value={editModel.notes}
                       placeholder={t("notes_placeholder")}
                       onChange={(e) => setEditModel((s) => ({ ...s, notes: e.target.value }))}
                     />
                     <Input
-                      className="mt-1 h-7 w-44 px-2 py-0.5 text-xs"
+                      className="mt-1 h-7 w-full sm:w-44 px-2 py-0.5 text-xs"
                       value={editModel.link}
                       placeholder={t("link_placeholder")}
                       onChange={(e) => setEditModel((s) => ({ ...s, link: e.target.value }))}
                     />
                     <textarea
-                      className="mt-1 w-44 rounded-md border border-border bg-transparent p-1 font-mono text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      className="mt-1 w-full sm:w-44 rounded-md border border-border bg-transparent p-1 font-mono text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                       rows={3}
                       placeholder={t("capabilities_placeholder")}
                       value={editModel.capabilities}
@@ -248,14 +248,14 @@ export function ModelsSection({ providers, models, refresh }: Props) {
                   </TableCell>
                   <TableCell>
                     <Input
-                      className="h-7 w-40 px-2 py-0.5 text-xs"
+                      className="h-7 w-full sm:w-40 px-2 py-0.5 text-xs"
                       value={editModel.upstream_model}
                       onChange={(e) => setEditModel((s) => ({ ...s, upstream_model: e.target.value }))}
                     />
                   </TableCell>
                   <TableCell>
                     <Select
-                      className="h-7 w-36 px-2 py-0.5 text-xs"
+                      className="h-7 w-full sm:w-36 px-2 py-0.5 text-xs"
                       value={editModel.provider_id}
                       onChange={(e) => setEditModel((s) => ({ ...s, provider_id: e.target.value }))}
                     >
@@ -268,14 +268,14 @@ export function ModelsSection({ providers, models, refresh }: Props) {
                   </TableCell>
                   <TableCell>
                     <Input
-                      className="h-7 w-20 px-2 py-0.5 text-xs"
+                      className="h-7 w-full sm:w-20 px-2 py-0.5 text-xs"
                       value={editModel.quantization}
                       onChange={(e) => setEditModel((s) => ({ ...s, quantization: e.target.value }))}
                     />
                   </TableCell>
                   <TableCell className="text-right">
                     <Input
-                      className="h-7 w-20 px-2 py-0.5 text-right text-xs"
+                      className="h-7 w-full sm:w-20 px-2 py-0.5 text-right text-xs"
                       type="number"
                       step="0.0001"
                       min="0"
@@ -285,7 +285,7 @@ export function ModelsSection({ providers, models, refresh }: Props) {
                   </TableCell>
                   <TableCell className="text-right">
                     <Input
-                      className="h-7 w-20 px-2 py-0.5 text-right text-xs"
+                      className="h-7 w-full sm:w-20 px-2 py-0.5 text-right text-xs"
                       type="number"
                       step="0.0001"
                       min="0"
@@ -294,7 +294,7 @@ export function ModelsSection({ providers, models, refresh }: Props) {
                     />
                   </TableCell>
                   <TableCell className="text-right">
-                    <div className="flex justify-end gap-2">
+                    <div className="flex justify-end gap-2 whitespace-nowrap">
                       <Button variant="outline" size="sm" onClick={() => setEditingModelId(null)}>
                         {t("cancel")}
                       </Button>
@@ -341,7 +341,7 @@ export function ModelsSection({ providers, models, refresh }: Props) {
                   <TableCell className="text-right">${m.input_price_per_million}</TableCell>
                   <TableCell className="text-right">${m.output_price_per_million}</TableCell>
                   <TableCell className="text-right">
-                    <div className="flex justify-end gap-2">
+                    <div className="flex justify-end gap-2 whitespace-nowrap">
                       <Button variant="outline" size="sm" onClick={() => startEditModel(m)}>
                         {t("edit")}
                       </Button>

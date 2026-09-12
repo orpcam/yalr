@@ -300,9 +300,9 @@ export default function Overview() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">{t("nav_overview")}</h1>
-        <div className="flex gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h1 className="w-full text-2xl font-bold sm:w-auto">{t("nav_overview")}</h1>
+        <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
           <Button
             variant={liveOn ? "default" : "outline"}
             className="h-9"
@@ -325,7 +325,7 @@ export default function Overview() {
             {t("live")}
           </Button>
           <Select
-            className="w-44"
+            className="w-full sm:w-44"
             value={keyName}
             onChange={(e) => setKeyName(e.target.value)}
           >
@@ -337,7 +337,7 @@ export default function Overview() {
             ))}
           </Select>
           <Select
-            className="w-36"
+            className="w-full sm:w-36"
             value={hours}
             onChange={(e) => setHours(Number(e.target.value))}
           >
@@ -351,10 +351,10 @@ export default function Overview() {
 
       {liveOn && (
         <Card>
-          <CardHeader className="flex flex-row items-center justify-between">
+          <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-2">
             <CardTitle>{t("live_performance")}</CardTitle>
             <Select
-              className="w-28"
+              className="w-full sm:w-28"
               value={liveWindow}
               onChange={(e) => setLiveWindow(Number(e.target.value))}
             >
@@ -367,27 +367,27 @@ export default function Overview() {
             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-5">
               <div>
                 <p className="text-sm text-muted-foreground">{t("decode_tps")}</p>
-                <p className="text-2xl font-bold">
+                <p className="truncate tabular-nums text-2xl font-bold">
                   {totalDecode !== null ? formatTps(totalDecode, locale) : "–"}
                 </p>
               </div>
               <div>
                 <p className="text-sm text-muted-foreground">{t("prefill_tps")}</p>
-                <p className="text-2xl font-bold">
+                <p className="truncate tabular-nums text-2xl font-bold">
                   {totalPrefill !== null ? formatTps(totalPrefill, locale) : "–"}
                 </p>
               </div>
               <div>
                 <p className="text-sm text-muted-foreground">{t("requests_in_progress")}</p>
-                <p className="text-2xl font-bold">{totalInFlight}</p>
+                <p className="tabular-nums text-2xl font-bold">{totalInFlight}</p>
               </div>
               <div>
                 <p className="text-sm text-muted-foreground">{t("queued")}</p>
-                <p className="text-2xl font-bold">{totalQueued !== null ? totalQueued : "–"}</p>
+                <p className="tabular-nums text-2xl font-bold">{totalQueued !== null ? totalQueued : "–"}</p>
               </div>
               <div>
                 <p className="text-sm text-muted-foreground">{t("error_rate")}</p>
-                <p className={`text-2xl font-bold ${errorRateClass(errRate)}`}>
+                <p className={`truncate tabular-nums text-2xl font-bold ${errorRateClass(errRate)}`}>
                   {totalReqs > 0 ? formatPercent(errRate, locale) : "–"}
                 </p>
               </div>
@@ -397,7 +397,7 @@ export default function Overview() {
             </p>
 
             {liveStats && liveStats.providers.length > 0 ? (
-              <div className="overflow-x-auto">
+              <div className="w-full overflow-x-auto overscroll-x-contain">
                 <Table className="min-w-[960px]">
                   <TableHeader>
                     <TableRow>
@@ -533,7 +533,7 @@ export default function Overview() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">
+            <div className="tabular-nums text-2xl font-bold">
               {stats ? formatNumber(stats.total_requests) : "–"}
             </div>
             {stats && stats.total_requests > 0 && (
@@ -555,7 +555,7 @@ export default function Overview() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">
+            <div className="truncate tabular-nums text-2xl font-bold">
               {stats ? formatCost(stats.total_cost) : "–"}
             </div>
           </CardContent>
@@ -567,7 +567,7 @@ export default function Overview() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">
+            <div className="truncate tabular-nums text-2xl font-bold">
               {stats
                 ? formatNumber(stats.total_prompt_tokens + stats.total_completion_tokens)
                 : "–"}
@@ -589,7 +589,7 @@ export default function Overview() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">
+            <div className="tabular-nums text-2xl font-bold">
               {stats ? formatDuration(stats.avg_duration_ms) : "–"}
             </div>
           </CardContent>

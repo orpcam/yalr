@@ -220,22 +220,22 @@ export default function Keys() {
         </CardHeader>
         <CardContent>
           <form onSubmit={create} className="flex flex-wrap items-end gap-4">
-            <div className="space-y-2">
+            <div className="w-full space-y-2 sm:w-auto">
               <Label htmlFor="key-name">{t("name")}</Label>
               <Input
                 id="key-name"
-                className="w-64"
+                className="w-full sm:w-64"
                 placeholder={t("name_placeholder")}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 required
               />
             </div>
-            <div className="space-y-2">
+            <div className="w-full space-y-2 sm:w-auto">
               <Label htmlFor="key-budget">{t("budget_usd_optional")}</Label>
               <Input
                 id="key-budget"
-                className="w-40"
+                className="w-full sm:w-40"
                 type="number"
                 step="0.01"
                 min="0"
@@ -254,7 +254,7 @@ export default function Keys() {
 
       <Card>
         <CardContent className="p-0">
-          <Table>
+          <Table className="min-w-[640px] md:min-w-0">
             <TableHeader>
               <TableRow>
                 <TableHead className="pl-4">{t("name")}</TableHead>

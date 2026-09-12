@@ -71,10 +71,10 @@ export function FallbacksSection({ fallbacks, modelNames, refresh }: Props) {
       </CardHeader>
       <CardContent className="space-y-4">
         <p className="text-sm text-muted-foreground">{t("fallback_hint")}</p>
-        <form onSubmit={createFallback} className="flex flex-wrap items-end gap-4">
-          <div className="space-y-2">
+        <form onSubmit={createFallback} className="flex flex-wrap items-center gap-2 sm:items-end sm:gap-4">
+          <div className="w-full space-y-2 sm:w-auto">
             <Label>{t("model")}</Label>
-            <Select className="w-48" value={fModel} onChange={(e) => setFModel(e.target.value)} required>
+            <Select className="w-full sm:w-48" value={fModel} onChange={(e) => setFModel(e.target.value)} required>
               <option value="">{t("select_placeholder")}</option>
               {modelNames.map((n) => (
                 <option key={n} value={n}>
@@ -83,9 +83,9 @@ export function FallbacksSection({ fallbacks, modelNames, refresh }: Props) {
               ))}
             </Select>
           </div>
-          <div className="space-y-2">
+          <div className="w-full space-y-2 sm:w-auto">
             <Label>{t("fallback_to")}</Label>
-            <Select className="w-48" value={fFallback} onChange={(e) => setFFallback(e.target.value)} required>
+            <Select className="w-full sm:w-48" value={fFallback} onChange={(e) => setFFallback(e.target.value)} required>
               <option value="">{t("select_placeholder")}</option>
               {modelNames
                 .filter((n) => n !== fModel)
@@ -101,7 +101,7 @@ export function FallbacksSection({ fallbacks, modelNames, refresh }: Props) {
 
         {error && <p className="text-sm text-destructive">{error}</p>}
 
-        <Table>
+        <Table className="min-w-[480px]">
           <TableHeader>
             <TableRow>
               <TableHead>{t("model")}</TableHead>
@@ -121,7 +121,7 @@ export function FallbacksSection({ fallbacks, modelNames, refresh }: Props) {
               <TableRow key={f.id}>
                 <TableCell className="font-medium">{f.model_name}</TableCell>
                 <TableCell>{f.fallback_model_name}</TableCell>
-                <TableCell className="text-right">
+                <TableCell className="text-right whitespace-nowrap">
                   <Button variant="destructive" size="sm" onClick={() => removeFallback(f)}>
                     {t("delete")}
                   </Button>

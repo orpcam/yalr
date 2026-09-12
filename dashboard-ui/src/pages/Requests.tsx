@@ -40,6 +40,10 @@ interface InFlight {
 
 const PAGE_SIZES = [25, 50, 100, 250];
 
+// Kompakter Spalten-Default auf Mobile (nur wenn keine gespeicherten
+// Preferences existieren; Desktop bleibt alle Spalten)
+const MOBILE_VISIBLE_COLUMNS = ["time", "model", "status", "total_tokens", "cost"];
+
 export default function Requests() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [keys, setKeys] = useState<VirtualKey[]>([]);
@@ -225,7 +229,11 @@ export default function Requests() {
     [t, formatDateTime, formatDuration, formatNumber, formatCost, locale]
   );
 
-  const { hidden, toggle, reset, visibleColumns } = useColumnVisibility("requests", columns);
+  const { hidden, toggle, reset, visibleColumns } = useColumnVisibility(
+    "requests",
+    columns,
+    MOBILE_VISIBLE_COLUMNS
+  );
 
   useEffect(() => {
     api
@@ -262,6 +270,11 @@ export default function Requests() {
   const resetPage = () => setPage(0);
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+  // Mit vielen Spalten: fixe Mindestbreite, damit die Tabelle im
+  // overflow-auto-Wrapper horizontal scrollt statt sich zu quetschen.
+  // Bei dem kompakten Mobile-Subset (5 Spalten) bleibt die Tabelle fluessig.
+  const tableMinWidth = visibleColumns.length > 6 ? "min-w-[900px] md:min-w-0" : undefined;
 
   // Live-Modus: SSE-Verbindung (ruecksetzen der liste passiert im toggle-handler)
   useEffect(() => {
@@ -316,7 +329,7 @@ export default function Requests() {
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h1 className="text-2xl font-bold">{t("nav_requests")}</h1>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             variant={live ? "default" : "outline"}
             size="sm"
@@ -338,7 +351,7 @@ export default function Requests() {
       </div>
 
       <div className="flex flex-wrap gap-2">
-        <Select className="w-48" value={keyName} onChange={(e) => { resetPage(); setKeyName(e.target.value); }}>
+        <Select className="w-full sm:w-48" value={keyName} onChange={(e) => { resetPage(); setKeyName(e.target.value); }}>
           <option value="">{t("all_keys")}</option>
           {keys.map((k) => (
             <option key={k.id} value={k.name}>
@@ -346,7 +359,7 @@ export default function Requests() {
             </option>
           ))}
         </Select>
-        <Select className="w-40" value={provider} onChange={(e) => { resetPage(); setProvider(e.target.value); }}>
+        <Select className="w-full sm:w-40" value={provider} onChange={(e) => { resetPage(); setProvider(e.target.value); }}>
           <option value="">{t("all_providers")}</option>
           <option value="openai">openai</option>
           <option value="anthropic">anthropic</option>
@@ -354,25 +367,25 @@ export default function Requests() {
           <option value="openai_compat">openai_compat</option>
         </Select>
         <Input
-          className="w-44"
+          className="w-full sm:w-44"
           placeholder={t("model_placeholder")}
           value={model}
           onChange={(e) => { resetPage(); setModel(e.target.value); }}
         />
-        <Select className="w-36" value={statusFilter} onChange={(e) => { resetPage(); setStatusFilter(e.target.value); }}>
+        <Select className="w-full sm:w-36" value={statusFilter} onChange={(e) => { resetPage(); setStatusFilter(e.target.value); }}>
           <option value="">{t("all_status")}</option>
           <option value="200">2xx</option>
           <option value="400">4xx</option>
           <option value="500">5xx</option>
         </Select>
-        <Select className="w-36" value={hours} onChange={(e) => { resetPage(); setHours(Number(e.target.value)); }}>
+        <Select className="w-full sm:w-36" value={hours} onChange={(e) => { resetPage(); setHours(Number(e.target.value)); }}>
           <option value={1}>{t("last_hour")}</option>
           <option value={24}>{t("last_24h")}</option>
           <option value={168}>{t("last_7d")}</option>
           <option value={720}>{t("last_30d")}</option>
         </Select>
         <Select
-          className="w-32"
+          className="w-full sm:w-32"
           value={pageSize}
           onChange={(e) => { resetPage(); setPageSize(Number(e.target.value)); }}
         >
@@ -387,7 +400,7 @@ export default function Requests() {
       {live && inFlight.length > 0 && (
         <Card>
           <CardContent className="p-0">
-            <Table>
+            <Table className={tableMinWidth}>
               <TableHeader>
                 <TableRow>
                   {visibleColumns
@@ -419,7 +432,7 @@ export default function Requests() {
 
       <Card>
         <CardContent className="p-0">
-          <Table>
+          <Table className={tableMinWidth}>
             <TableHeader>
               <TableRow>
                 {visibleColumns.map((col) => (
