@@ -1961,11 +1961,14 @@ pub async fn timeseries(
             h
         }
         HoursRange::All => {
-            // kein unterer Zeitfilter; Spanne = seit Aufzeichnung
+            // kein unterer Zeitfilter; Spanne = seit Aufzeichnung.
+            // min() über non-nullable DateTime64 liefert bei leerer Menge den
+            // Epochen-Default statt NULL -> count() als sicheres Leer-Kriterium.
             #[derive(clickhouse::Row, serde::Serialize, serde::Deserialize)]
             struct MinRow {
-                #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
-                earliest: Option<chrono::DateTime<chrono::Utc>>,
+                #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+                earliest: chrono::DateTime<chrono::Utc>,
+                total: u64,
             }
             // dieselben Filter wie die Haupt-Query, aber ohne Zeitbedingung (es gibt bei "all" keine)
             let mut min_clauses: Vec<String> = Vec::new();
@@ -1983,8 +1986,9 @@ pub async fn timeseries(
             } else {
                 format!("WHERE {}", min_clauses.join(" AND "))
             };
-            let min_sql =
-                format!(r#"SELECT min(timestamp) AS earliest FROM yalr.request_logs {min_where}"#);
+            let min_sql = format!(
+                r#"SELECT min(timestamp) AS earliest, count() AS total FROM yalr.request_logs {min_where}"#
+            );
             let mut min_query = state.ch.query(&min_sql);
             if let Some(key) = &q.key_name {
                 min_query = min_query.bind(key.clone());
@@ -1995,8 +1999,8 @@ pub async fn timeseries(
             if let Some(model) = &q.model {
                 min_query = min_query.bind(model.clone());
             }
-            let earliest = match min_query.fetch_one::<MinRow>().await {
-                Ok(r) => r.earliest,
+            let min_row = match min_query.fetch_one::<MinRow>().await {
+                Ok(r) => r,
                 Err(e) => {
                     tracing::error!("clickhouse timeseries min failed: {e}");
                     return (
@@ -2006,19 +2010,14 @@ pub async fn timeseries(
                         .into_response();
                 }
             };
-            match earliest {
-                None => {
-                    // keine Aufzeichnung -> leere Response in der bisherigen Form
-                    return Json(json!({ "timeseries": [] })).into_response();
-                }
-                Some(e) => {
-                    let now = chrono::Utc::now();
-                    let secs = now.signed_duration_since(e).num_seconds();
-                    // ceil auf Stunden, mindestens 1
-                    let h = ((secs.max(0) + 3599) / 3600).max(1) as u32;
-                    h
-                }
+            if min_row.total == 0 {
+                // keine Aufzeichnung (für diese Filter) -> leere Response in der bisherigen Form
+                return Json(json!({ "timeseries": [] })).into_response();
             }
+            let now = chrono::Utc::now();
+            let secs = now.signed_duration_since(min_row.earliest).num_seconds();
+            // ceil auf Stunden, mindestens 1
+            ((secs.max(0) + 3599) / 3600).max(1) as u32
         }
     };
 
