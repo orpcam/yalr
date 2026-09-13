@@ -4,8 +4,18 @@ import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ThemeToggle } from "@/components/ThemeToggle";
-import { Menu, Network } from "lucide-react";
+import { Menu, Network, PanelLeft } from "lucide-react";
 import { useLanguage, TranslationKey } from "@/lib/i18n";
+
+const SIDEBAR_STORAGE_KEY = "llm-gw:sidebar";
+
+function initialSidebarHidden(): boolean {
+  try {
+    return localStorage.getItem(SIDEBAR_STORAGE_KEY) === "hidden";
+  } catch {
+    return false;
+  }
+}
 
 const navItems: { to: string; labelKey: TranslationKey }[] = [
   { to: "/", labelKey: "nav_overview" },
@@ -18,6 +28,7 @@ const navItems: { to: string; labelKey: TranslationKey }[] = [
 export function AppLayout() {
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarHidden, setSidebarHidden] = useState<boolean>(initialSidebarHidden);
   const navigate = useNavigate();
   const location = useLocation();
   const { t } = useLanguage();
@@ -50,6 +61,15 @@ export function AppLayout() {
       document.body.style.overflow = "";
     };
   }, [sidebarOpen]);
+
+  // Desktop-Ausblendung persistieren
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_STORAGE_KEY, sidebarHidden ? "hidden" : "visible");
+    } catch {
+      // localStorage nicht verfügbar -> ignorieren
+    }
+  }, [sidebarHidden]);
 
   // escape schliesst den offenen mobile drawer
   useEffect(() => {
@@ -91,7 +111,9 @@ export function AppLayout() {
         className={cn(
           "flex flex-col border-r bg-card",
           // mobil: off-canvas drawer; ab md: statische sidebar wie bisher
-          "fixed inset-y-0 left-0 z-50 w-64 transition-transform duration-200 md:static md:w-56 md:translate-x-0",
+          // (solange sie nicht ausgeblendet ist)
+          "fixed inset-y-0 left-0 z-50 w-64 transition-transform duration-200",
+          !sidebarHidden && "md:static md:w-56 md:translate-x-0",
           sidebarOpen ? "translate-x-0" : "-translate-x-full"
         )}
       >
@@ -125,17 +147,40 @@ export function AppLayout() {
         </div>
       </aside>
       <main className="flex-1 overflow-auto p-4 sm:p-6">
-        <div className="mb-4 flex items-center gap-2 md:hidden">
+        <div className="mb-4 flex items-center gap-2">
+          {/* Hamburger: mobil immer sichtbar; Desktop nur, wenn Sidebar ausgeblendet */}
           <button
             type="button"
-            aria-label="Navigation"
-            className="inline-flex h-11 w-11 items-center justify-center rounded-md text-foreground hover:bg-accent hover:text-accent-foreground"
-            onClick={() => setSidebarOpen(true)}
+            aria-label={t("show_sidebar")}
+            title={t("show_sidebar")}
+            className={cn(
+              "inline-flex h-11 w-11 items-center justify-center rounded-md text-foreground hover:bg-accent hover:text-accent-foreground",
+              sidebarHidden ? "md:inline-flex" : "md:hidden"
+            )}
+            onClick={() => {
+              const isDesktop = window.matchMedia("(min-width: 768px)").matches;
+              if (isDesktop) setSidebarHidden(false);
+              else setSidebarOpen(true);
+            }}
           >
             <Menu className="h-5 w-5" />
           </button>
-          <Network className="h-6 w-6 shrink-0 text-emerald-500" />
-          <span className="text-lg font-bold">YALR</span>
+          {/* Desktop: Sidebar ausblenden, nur wenn sie sichtbar ist */}
+          {!sidebarHidden && (
+            <button
+              type="button"
+              aria-label={t("hide_sidebar")}
+              title={t("hide_sidebar")}
+              className="hidden h-11 w-11 items-center justify-center rounded-md text-foreground hover:bg-accent hover:text-accent-foreground md:inline-flex"
+              onClick={() => setSidebarHidden(true)}
+            >
+              <PanelLeft className="h-5 w-5" />
+            </button>
+          )}
+          <span className="flex items-center gap-2 md:hidden">
+            <Network className="h-6 w-6 shrink-0 text-emerald-500" />
+            <span className="text-lg font-bold">YALR</span>
+          </span>
         </div>
         <Outlet />
       </main>

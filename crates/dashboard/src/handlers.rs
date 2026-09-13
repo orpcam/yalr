@@ -1781,12 +1781,68 @@ pub async fn get_log(
     }
 }
 
+// ============================================================
+// Overview-Endpunkte (stats/timeseries/breakdown): Stunden-Parameter
+// ============================================================
+
+/// Obergrenze fuer `hours` in Stunden: 1 Jahr.
+const HOURS_MAX: u32 = 24 * 365;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoursRange {
+    /// Zeitraum in Stunden (1..=HOURS_MAX).
+    Hours(u32),
+    /// "all" -> seit Aufzeichnung, kein unterer Zeitfilter.
+    All,
+}
+
+/// Parsen des `hours`-Query-Parameters.
+/// - fehlend/leer -> Default 24h
+/// - "all" (case-insensitiv) -> seit Aufzeichnung
+/// - positive ganze Zahl 1..=HOURS_MAX -> Zeitraum in Stunden
+/// - alles andere (0, negativ, nicht-numerisch, >HOURS_MAX) -> Fehler
+fn parse_hours_param(raw: Option<&str>) -> Result<HoursRange, &'static str> {
+    let s = raw.unwrap_or("").trim();
+    if s.is_empty() {
+        return Ok(HoursRange::Hours(24));
+    }
+    if s.eq_ignore_ascii_case("all") {
+        return Ok(HoursRange::All);
+    }
+    match s.parse::<u32>() {
+        Ok(h) if (1..=HOURS_MAX).contains(&h) => Ok(HoursRange::Hours(h)),
+        _ => Err("hours muss eine positive ganze Zahl (1-8760) sein oder 'all'"),
+    }
+}
+
+/// Kleinstes Bucket aus [1,3,6,12,24,168,336,720] Stunden, bei dem
+/// ceil(span/bucket) <= 720 Punkte bleibt. Fallback: groesstes Bucket (720).
+fn pick_bucket_hours(span_hours: u32) -> u32 {
+    const BUCKETS: [u32; 8] = [1, 3, 6, 12, 24, 168, 336, 720];
+    for &b in &BUCKETS {
+        // ceil-division overflow-sicher: (span-1)/b + 1
+        let points = (span_hours - 1) / b + 1;
+        if points <= 720 {
+            return b;
+        }
+    }
+    720
+}
+
+fn bad_request(msg: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "bad request", "detail": msg})),
+    )
+        .into_response()
+}
+
 #[derive(Deserialize)]
 pub struct StatsQuery {
     pub key_name: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
-    pub hours: Option<u32>,
+    pub hours: Option<String>,
 }
 
 pub async fn stats(
@@ -1797,9 +1853,16 @@ pub async fn stats(
     if auth::require_session(&state, &headers).await.is_err() {
         return unauthorized();
     }
-    let hours = q.hours.unwrap_or(24).min(24 * 30);
+    let range = match parse_hours_param(q.hours.as_deref()) {
+        Ok(r) => r,
+        Err(msg) => return bad_request(msg),
+    };
 
-    let mut where_clauses = vec!["timestamp >= now() - INTERVAL ? HOUR".to_string()];
+    let mut where_clauses: Vec<String> = Vec::new();
+    // bei "all" (HoursRange::All) entfaellt der untere Zeitfilter komplett
+    if let HoursRange::Hours(_) = range {
+        where_clauses.push("timestamp >= now() - INTERVAL ? HOUR".to_string());
+    }
     if q.key_name.is_some() {
         where_clauses.push("key_name = ?".to_string());
     }
@@ -1809,7 +1872,11 @@ pub async fn stats(
     if q.model.is_some() {
         where_clauses.push("model = ?".to_string());
     }
-    let where_sql = where_clauses.join(" AND ");
+    let where_sql = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", where_clauses.join(" AND "))
+    };
 
     let sql = format!(
         r#"
@@ -1822,11 +1889,14 @@ pub async fn stats(
             sum(completion_tokens) AS total_completion_tokens,
             sum(duration_ms) / greatest(count(), 1) AS avg_duration_ms
         FROM yalr.request_logs
-        WHERE {where_sql}
+        {where_sql}
         "#
     );
 
-    let mut query = state.ch.query(&sql).bind(hours);
+    let mut query = state.ch.query(&sql);
+    if let HoursRange::Hours(h) = range {
+        query = query.bind(h);
+    }
     if let Some(key) = &q.key_name {
         query = query.bind(key.clone());
     }
@@ -1866,10 +1936,10 @@ pub struct TimeseriesQuery {
     pub key_name: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
-    pub hours: Option<u32>,
+    pub hours: Option<String>,
 }
 
-/// Kosten/requests pro stunde ( fuer charts).
+/// Kosten/requests pro stunde (fuer charts).
 pub async fn timeseries(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1878,9 +1948,80 @@ pub async fn timeseries(
     if auth::require_session(&state, &headers).await.is_err() {
         return unauthorized();
     }
-    let hours = q.hours.unwrap_or(24).min(24 * 30);
+    let range = match parse_hours_param(q.hours.as_deref()) {
+        Ok(r) => r,
+        Err(msg) => return bad_request(msg),
+    };
 
-    let mut where_clauses = vec!["timestamp >= now() - INTERVAL ? HOUR".to_string()];
+    // Spanne in Stunden bestimmen + ggf. unteren Zeitfilter setzen
+    let mut where_clauses: Vec<String> = Vec::new();
+    let span_hours: u32 = match range {
+        HoursRange::Hours(h) => {
+            where_clauses.push("timestamp >= now() - INTERVAL ? HOUR".to_string());
+            h
+        }
+        HoursRange::All => {
+            // kein unterer Zeitfilter; Spanne = seit Aufzeichnung
+            #[derive(clickhouse::Row, serde::Serialize, serde::Deserialize)]
+            struct MinRow {
+                #[serde(with = "clickhouse::serde::chrono::datetime64::millis::option")]
+                earliest: Option<chrono::DateTime<chrono::Utc>>,
+            }
+            // dieselben Filter wie die Haupt-Query, aber ohne Zeitbedingung (es gibt bei "all" keine)
+            let mut min_clauses: Vec<String> = Vec::new();
+            if q.key_name.is_some() {
+                min_clauses.push("key_name = ?".to_string());
+            }
+            if q.provider.is_some() {
+                min_clauses.push("provider = ?".to_string());
+            }
+            if q.model.is_some() {
+                min_clauses.push("model = ?".to_string());
+            }
+            let min_where = if min_clauses.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {}", min_clauses.join(" AND "))
+            };
+            let min_sql =
+                format!(r#"SELECT min(timestamp) AS earliest FROM yalr.request_logs {min_where}"#);
+            let mut min_query = state.ch.query(&min_sql);
+            if let Some(key) = &q.key_name {
+                min_query = min_query.bind(key.clone());
+            }
+            if let Some(provider) = &q.provider {
+                min_query = min_query.bind(provider.clone());
+            }
+            if let Some(model) = &q.model {
+                min_query = min_query.bind(model.clone());
+            }
+            let earliest = match min_query.fetch_one::<MinRow>().await {
+                Ok(r) => r.earliest,
+                Err(e) => {
+                    tracing::error!("clickhouse timeseries min failed: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "query failed"})),
+                    )
+                        .into_response();
+                }
+            };
+            match earliest {
+                None => {
+                    // keine Aufzeichnung -> leere Response in der bisherigen Form
+                    return Json(json!({ "timeseries": [] })).into_response();
+                }
+                Some(e) => {
+                    let now = chrono::Utc::now();
+                    let secs = now.signed_duration_since(e).num_seconds();
+                    // ceil auf Stunden, mindestens 1
+                    let h = ((secs.max(0) + 3599) / 3600).max(1) as u32;
+                    h
+                }
+            }
+        }
+    };
+
     if q.key_name.is_some() {
         where_clauses.push("key_name = ?".to_string());
     }
@@ -1890,23 +2031,35 @@ pub async fn timeseries(
     if q.model.is_some() {
         where_clauses.push("model = ?".to_string());
     }
-    let where_sql = where_clauses.join(" AND ");
+    let where_sql = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", where_clauses.join(" AND "))
+    };
 
+    let bucket = pick_bucket_hours(span_hours);
+    // bucket ist ein u32 aus der festen Liste [1,3,6,12,24,168,336,720].
+    // `INTERVAL ? HOUR` ist mit der clickhouse-Crate nicht bindbar, daher
+    // wird der Wert direkt in den SQL-String formatiert. Keine
+    // Injektionsgefahr: der Wert stammt ausschliesslich aus der festen Liste.
     let sql = format!(
         r#"
         SELECT
-            toDateTime64(toStartOfHour(timestamp), 3) AS bucket,
+            toDateTime64(toStartOfInterval(timestamp, INTERVAL {bucket} HOUR), 3) AS bucket,
             count() AS requests,
             sum(cost_usd) AS cost,
             sum(duration_ms) / greatest(count(), 1) AS avg_duration_ms
         FROM yalr.request_logs
-        WHERE {where_sql}
+        {where_sql}
         GROUP BY bucket
         ORDER BY bucket
         "#
     );
 
-    let mut query = state.ch.query(&sql).bind(hours);
+    let mut query = state.ch.query(&sql);
+    if let HoursRange::Hours(h) = range {
+        query = query.bind(h);
+    }
     if let Some(key) = &q.key_name {
         query = query.bind(key.clone());
     }
@@ -1956,7 +2109,7 @@ pub async fn timeseries(
 #[derive(Deserialize)]
 pub struct GroupByQuery {
     pub group_by: Option<String>,
-    pub hours: Option<u32>,
+    pub hours: Option<String>,
     pub key_name: Option<String>,
 }
 
@@ -1968,7 +2121,10 @@ pub async fn breakdown(
     if auth::require_session(&state, &headers).await.is_err() {
         return unauthorized();
     }
-    let hours = q.hours.unwrap_or(24).min(24 * 30);
+    let range = match parse_hours_param(q.hours.as_deref()) {
+        Ok(r) => r,
+        Err(msg) => return bad_request(msg),
+    };
     // group_col: einzelne spalte | model_provider: kombi aus beiden feldern
     let (group_col, with_provider) = match q.group_by.as_deref() {
         Some("provider") => ("provider", false),
@@ -1988,11 +2144,18 @@ pub async fn breakdown(
         tokens: u64,
     }
 
-    let mut where_clauses = vec!["timestamp >= now() - INTERVAL ? HOUR".to_string()];
+    let mut where_clauses: Vec<String> = Vec::new();
+    if let HoursRange::Hours(_) = range {
+        where_clauses.push("timestamp >= now() - INTERVAL ? HOUR".to_string());
+    }
     if q.key_name.is_some() {
         where_clauses.push("key_name = ?".to_string());
     }
-    let where_sql = where_clauses.join(" AND ");
+    let where_sql = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", where_clauses.join(" AND "))
+    };
 
     let sql = if with_provider {
         format!(
@@ -2005,7 +2168,7 @@ pub async fn breakdown(
                 sum(cost_usd) AS cost,
                 sum(prompt_tokens + completion_tokens) AS tokens
             FROM yalr.request_logs
-            WHERE {where_sql}
+            {where_sql}
             GROUP BY group_name, provider_name
             ORDER BY cost DESC
             LIMIT 100
@@ -2022,7 +2185,7 @@ pub async fn breakdown(
                 sum(cost_usd) AS cost,
                 sum(prompt_tokens + completion_tokens) AS tokens
             FROM yalr.request_logs
-            WHERE {where_sql}
+            {where_sql}
             GROUP BY group_name
             ORDER BY cost DESC
             LIMIT 100
@@ -2030,7 +2193,10 @@ pub async fn breakdown(
         )
     };
 
-    let mut query = state.ch.query(&sql).bind(hours);
+    let mut query = state.ch.query(&sql);
+    if let HoursRange::Hours(h) = range {
+        query = query.bind(h);
+    }
     if let Some(key) = &q.key_name {
         query = query.bind(key.clone());
     }
@@ -4653,6 +4819,67 @@ yalr_upstream_rate_window_seconds{provider="p"} 2.5
         // Filter trifft nichts
         let result = super::filter_in_flight(snapshot, &Some("keyX".into()));
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_hours_param_all() {
+        assert_eq!(super::parse_hours_param(Some("all")), Ok(super::HoursRange::All));
+        assert_eq!(super::parse_hours_param(Some("ALL")), Ok(super::HoursRange::All));
+        assert_eq!(super::parse_hours_param(Some("  all ")), Ok(super::HoursRange::All));
+    }
+
+    #[test]
+    fn test_parse_hours_param_number() {
+        assert_eq!(super::parse_hours_param(None), Ok(super::HoursRange::Hours(24)));
+        assert_eq!(super::parse_hours_param(Some("")), Ok(super::HoursRange::Hours(24)));
+        assert_eq!(super::parse_hours_param(Some("   ")), Ok(super::HoursRange::Hours(24)));
+        assert_eq!(super::parse_hours_param(Some("24")), Ok(super::HoursRange::Hours(24)));
+        assert_eq!(super::parse_hours_param(Some("1")), Ok(super::HoursRange::Hours(1)));
+        assert_eq!(super::parse_hours_param(Some("8760")), Ok(super::HoursRange::Hours(8760)));
+    }
+
+    #[test]
+    fn test_parse_hours_param_invalid() {
+        assert!(super::parse_hours_param(Some("0")).is_err());
+        assert!(super::parse_hours_param(Some("-5")).is_err());
+        assert!(super::parse_hours_param(Some("8761")).is_err());
+        assert!(super::parse_hours_param(Some("abc")).is_err());
+        assert!(super::parse_hours_param(Some("1.5")).is_err());
+    }
+
+    #[test]
+    fn test_pick_bucket_hours() {
+        // Bis 720h Spanne bleibt 1h-Bucket (bestehendes Verhalten)
+        assert_eq!(super::pick_bucket_hours(1), 1);
+        assert_eq!(super::pick_bucket_hours(24), 1);
+        assert_eq!(super::pick_bucket_hours(720), 1);
+        // Ueber 720h -> groessere Bucket
+        assert_eq!(super::pick_bucket_hours(721), 3);
+        assert_eq!(super::pick_bucket_hours(8760), 24);
+        // Sehr groessen Spannen fallen auf 720 zurueck
+        assert_eq!(super::pick_bucket_hours(u32::MAX), 720);
+    }
+
+    #[test]
+    fn test_pick_bucket_hours_boundaries() {
+      // Invariante: kleinstes b aus [1,3,6,12,24,168,336,720] mit ceil(span/b) <= 720.
+      // span = 720*b  -> b ; span = 720*b + 1 -> naechstgroesseres b (b=720: Fallback 720).
+      const TRANSITIONS: [(u32, u32, u32); 8] = [
+        (1, 720 * 1, 720 * 1 + 1),
+        (3, 720 * 3, 720 * 3 + 1),
+        (6, 720 * 6, 720 * 6 + 1),
+        (12, 720 * 12, 720 * 12 + 1),
+        (24, 720 * 24, 720 * 24 + 1),
+        (168, 720 * 168, 720 * 168 + 1),
+        (336, 720 * 336, 720 * 336 + 1),
+        (720, 720 * 720, 720 * 720 + 1),
+      ];
+      const BUCKETS: [u32; 8] = [1, 3, 6, 12, 24, 168, 336, 720];
+      for (i, (b, at, plusOne)) in TRANSITIONS.iter().enumerate() {
+        assert_eq!(super::pick_bucket_hours(*at), *b);
+        let expected_next = if i + 1 < BUCKETS.len() { BUCKETS[i + 1] } else { 720 };
+        assert_eq!(super::pick_bucket_hours(*plusOne), expected_next);
+      }
     }
 }
 

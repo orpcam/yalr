@@ -38,6 +38,8 @@ const en = {
   logout: "Log out",
   theme_light: "☀️ Light mode",
   theme_dark: "🌙 Dark mode",
+  hide_sidebar: "Hide sidebar",
+  show_sidebar: "Show sidebar",
 
   // Login
   login_title: "YALR",
@@ -53,6 +55,8 @@ const en = {
   last_24h: "24 hours",
   last_7d: "7 days",
   last_30d: "30 days",
+  last_year: "1 year",
+  all_time: "All time",
   requests: "Requests",
   cost: "Cost",
   tokens: "Tokens",
@@ -235,6 +239,8 @@ const de: Record<TranslationKey, string> = {
   logout: "Abmelden",
   theme_light: "☀️ Hell",
   theme_dark: "🌙 Dunkel",
+  hide_sidebar: "Sidebar ausblenden",
+  show_sidebar: "Sidebar einblenden",
 
   login_title: "YALR",
   login_username: "Benutzername",
@@ -248,6 +254,8 @@ const de: Record<TranslationKey, string> = {
   last_24h: "24 Stunden",
   last_7d: "7 Tage",
   last_30d: "30 Tage",
+  last_year: "1 Jahr",
+  all_time: "Seit Aufzeichnung",
   requests: "Anfragen",
   cost: "Kosten",
   tokens: "Tokens",

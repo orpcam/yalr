@@ -40,8 +40,10 @@ function errorRateClass(rate: number) {
   return "";
 }
 
+type TimeRange = "1" | "24" | "168" | "720" | "8760" | "all";
+
 export default function Overview() {
-  const [hours, setHours] = useState(24);
+  const [hours, setHours] = useState<TimeRange>("8760");
   const [keyName, setKeyName] = useState("");
   const [stats, setStats] = useState<Stats | null>(null);
   const [ts, setTs] = useState<TimeseriesPoint[]>([]);
@@ -235,10 +237,22 @@ export default function Overview() {
     return () => es.close();
   }, [liveOn]);
 
-  const chartData = useMemo(
-    () => ts.map((p) => ({ ...p, time: formatTime(p.bucket) })),
-    [ts, formatTime]
-  );
+  const chartData = useMemo(() => {
+    // bei langen zeitraeumen (1 jahr / seit aufzeichnung) ticks als datum,
+    // da sonst 365+ stundenpunkte als uhrzeit nicht lesbar sind
+    const useDate = hours === "8760" || hours === "all";
+    return ts.map((p) => ({
+      ...p,
+      time: useDate
+        ? new Date(p.bucket).toLocaleDateString(
+            locale,
+            hours === "all"
+              ? { day: "2-digit", month: "2-digit", year: "2-digit" }
+              : { day: "2-digit", month: "2-digit" }
+          )
+        : formatTime(p.bucket),
+    }));
+  }, [ts, formatTime, hours, locale]);
 
   // in-flight pro provider: quelle der wahrheit ist der 1s-poll (in_flight);
   // p.running bleibt als fallback, falls das pollfeld fehlt.
@@ -339,12 +353,14 @@ export default function Overview() {
           <Select
             className="w-full sm:w-36"
             value={hours}
-            onChange={(e) => setHours(Number(e.target.value))}
+            onChange={(e) => setHours(e.target.value as TimeRange)}
           >
-            <option value={1}>{t("last_hour")}</option>
-            <option value={24}>{t("last_24h")}</option>
-            <option value={168}>{t("last_7d")}</option>
-            <option value={720}>{t("last_30d")}</option>
+            <option value="1">{t("last_hour")}</option>
+            <option value="24">{t("last_24h")}</option>
+            <option value="168">{t("last_7d")}</option>
+            <option value="720">{t("last_30d")}</option>
+            <option value="8760">{t("last_year")}</option>
+            <option value="all">{t("all_time")}</option>
           </Select>
         </div>
       </div>
