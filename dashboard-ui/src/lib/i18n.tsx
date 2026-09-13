@@ -101,6 +101,7 @@ const en = {
   last_seconds: "last {s} seconds",
   avg_latency: "Avg latency",
   success_rate: "{pct} successful",
+  via_fallback: "{n} via fallback ({pct})",
   tokens_in_out: "{in} in / {out} out",
   requests_cost_over_time: "Requests & cost over time",
   cost_per_model: "Cost per model",
@@ -124,6 +125,7 @@ const en = {
   no_requests: "No requests in the selected time range.",
   live: "Live",
   first_token: "first token after {ms}",
+  fallback: "Fallback",
 
   // RequestDetail
   back: "← Back",
@@ -134,6 +136,8 @@ const en = {
   error: "Error: {type}",
   request_body: "Request body",
   response_body: "Response body",
+  fallback_served: "Requested: {requested} — served via fallback: {served}",
+  attempts_made: "Targets tried: {n}",
   retry: "Retry",
   load_failed: "Could not load data.",
 
@@ -300,6 +304,7 @@ const de: Record<TranslationKey, string> = {
   last_seconds: "letzte {s} Sekunden",
   avg_latency: "Ø Latenz",
   success_rate: "{pct} erfolgreich",
+  via_fallback: "{n} via Fallback ({pct})",
   tokens_in_out: "{in} in / {out} out",
   requests_cost_over_time: "Requests & Kosten über Zeit",
   cost_per_model: "Kosten pro Modell",
@@ -322,6 +327,7 @@ const de: Record<TranslationKey, string> = {
   no_requests: "Keine Anfragen im gewählten Zeitraum.",
   live: "Live",
   first_token: "erstes Token nach {ms}",
+  fallback: "Fallback",
 
   back: "← Zurück",
   request_details: "Anfrage-Details",
@@ -331,6 +337,8 @@ const de: Record<TranslationKey, string> = {
   error: "Fehler: {type}",
   request_body: "Request-Body",
   response_body: "Response-Body",
+  fallback_served: "Angefragt: {requested} — bedient via Fallback: {served}",
+  attempts_made: "Versuchte Targets: {n}",
   retry: "Erneut versuchen",
   load_failed: "Daten konnten nicht geladen werden.",
 

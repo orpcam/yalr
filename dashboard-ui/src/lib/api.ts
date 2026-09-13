@@ -122,6 +122,10 @@ export interface LogEntry {
   cost_usd: number;
   duration_ms: number;
   first_byte_ms: number;
+  /** Fallback-Infos (Teil 3) — optional: Alt-Daten haben die Felder nicht */
+  is_fallback?: boolean;
+  original_model?: string;
+  attempts_made?: number;
 }
 
 // ===== Live-Events (SSE /dashboard-api/live) =====
@@ -153,6 +157,10 @@ export interface Stats {
   total_prompt_tokens: number;
   total_completion_tokens: number;
   avg_duration_ms: number;
+  /** Fallback-Stats (Teil 3) — optional-tolerant behandeln */
+  fallback_count?: number;
+  /** 0..1, anteil der erfolgreichen requests */
+  fallback_rate?: number;
 }
 
 export interface TimeseriesPoint {

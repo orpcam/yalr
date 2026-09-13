@@ -157,7 +157,20 @@ export default function Requests() {
       {
         id: "model",
         label: t("model"),
-        render: (log) => log.model || "–",
+        render: (log) => (
+          <span className="inline-flex items-center gap-1.5">
+            {log.model || "–"}
+            {log.is_fallback && (
+              <Badge
+                variant="outline"
+                className="whitespace-nowrap border-yellow-500 text-yellow-500"
+                title={log.original_model ? `${log.original_model} → ${log.model}` : undefined}
+              >
+                {t("fallback")}
+              </Badge>
+            )}
+          </span>
+        ),
       },
       {
         id: "status",
@@ -311,7 +324,12 @@ export default function Requests() {
       const f = filtersRef.current;
       if (f.keyName && log.key_name !== f.keyName) return;
       if (f.provider && log.provider !== f.provider) return;
-      if (f.model && !log.model.toLowerCase().includes(f.model.toLowerCase())) return;
+      if (
+        f.model &&
+        !log.model.toLowerCase().includes(f.model.toLowerCase()) &&
+        !(log.original_model && log.original_model.toLowerCase().includes(f.model.toLowerCase()))
+      )
+        return;
       if (f.statusFilter) {
         const s = log.status;
         const bucket = s >= 200 && s < 300 ? "200" : s >= 400 && s < 500 ? "400" : "500";

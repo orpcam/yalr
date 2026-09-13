@@ -76,6 +76,27 @@ export default function RequestDetail() {
         <Badge variant={log.status >= 400 ? "error" : "success"}>{log.status}</Badge>
       </div>
 
+      {log.is_fallback && (
+        <Card className="border-yellow-500/50">
+          <CardContent className="flex flex-wrap items-center gap-x-4 gap-y-1 pt-4 text-sm">
+            <Badge variant="outline" className="border-yellow-500 text-yellow-500">
+              {t("fallback")}
+            </Badge>
+            <span className="break-all">
+              {t("fallback_served", {
+                requested: log.original_model || "–",
+                served: log.model,
+              })}
+            </span>
+            {log.attempts_made !== undefined && log.attempts_made > 0 && (
+              <span className="text-muted-foreground">
+                {t("attempts_made", { n: log.attempts_made })}
+              </span>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
       <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-4">
         <Card>
           <CardHeader className="pb-2">

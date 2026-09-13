@@ -43,7 +43,7 @@ pub async fn proxy(
     let vk = match auth::authenticate(&state, &headers).await {
         Ok(vk) => vk,
         Err(status) => {
-            return error_response(state, None, &request_id, &endpoint, started, status, "auth", &status_text(&status), &body).await;
+            return error_response(state, None, &request_id, &endpoint, started, status, "auth", &status_text(&status), 0, &body).await;
         }
     };
 
@@ -51,7 +51,7 @@ pub async fn proxy(
     let req_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            return error_response(state, Some(&vk), &request_id, &endpoint, started, StatusCode::BAD_REQUEST, "invalid_json", &e.to_string(), &body).await;
+            return error_response(state, Some(&vk), &request_id, &endpoint, started, StatusCode::BAD_REQUEST, "invalid_json", &e.to_string(), 0, &body).await;
         }
     };
 
@@ -62,7 +62,7 @@ pub async fn proxy(
         .to_string();
 
     if requested_model.is_empty() {
-        return error_response(state, Some(&vk), &request_id, &endpoint, started, StatusCode::BAD_REQUEST, "missing_model", "request body has no 'model' field", &body).await;
+        return error_response(state, Some(&vk), &request_id, &endpoint, started, StatusCode::BAD_REQUEST, "missing_model", "request body has no 'model' field", 0, &body).await;
     }
 
     // 3) Route aufloesen (hybrid: header-override gewinnt, sonst model-name)
@@ -74,7 +74,7 @@ pub async fn proxy(
     let mut targets = match state.resolve_route(&requested_model).await {
         Some(t) => t,
         None => {
-            return error_response(state, Some(&vk), &request_id, &endpoint, started, StatusCode::NOT_FOUND, "unknown_model", &format!("model '{requested_model}' is not configured"), &body).await;
+            return error_response(state, Some(&vk), &request_id, &endpoint, started, StatusCode::NOT_FOUND, "unknown_model", &format!("model '{requested_model}' is not configured"), 0, &body).await;
         }
     };
 
@@ -88,7 +88,7 @@ pub async fn proxy(
         });
         if targets.is_empty() {
             let msg = format!("no enabled provider '{override_name}' for model '{requested_model}'");
-            return error_response(state, Some(&vk), &request_id, &endpoint, started, StatusCode::NOT_FOUND, "unknown_provider", &msg, &body).await;
+            return error_response(state, Some(&vk), &request_id, &endpoint, started, StatusCode::NOT_FOUND, "unknown_provider", &msg, 0, &body).await;
         }
         tracing::debug!("provider override '{override_name}' reduced targets {before} -> {}", targets.len());
     }
@@ -121,7 +121,9 @@ pub async fn proxy(
 
     // 5) Request gegen Targets ausfuehren (retry + fallback)
     let mut last_err: Option<ProviderError> = None;
+    let mut attempts_made: u8 = 0;
     for (attempt, target) in targets.iter().enumerate() {
+        attempts_made = attempts_made.saturating_add(1);
         let attempt_start = Instant::now();
         match execute_once(&state, target, &vk, &endpoint, &req_json, &request_id, wants_stream, native_anthropic).await {
             Ok(outcome) => {
@@ -174,7 +176,9 @@ pub async fn proxy(
     let err = last_err.unwrap_or(ProviderError::Status { status: 502, body: "no provider available".into() });
     let status = StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::BAD_GATEWAY);
     let error_type = if matches!(err, ProviderError::Network(_)) { "provider_network" } else { "provider_error" };
-    error_response(state, Some(&vk), &request_id, &endpoint, started, status, error_type, &err.to_string(), &body).await
+    // attempts_made: nur die tatsächlich ausgefuehrten Versuche (früher Abbruch
+    // bei nicht-retryablem Fehler zahlt nicht alle Targets der Route)
+    error_response(state, Some(&vk), &request_id, &endpoint, started, status, error_type, &err.to_string(), attempts_made.min(255), &body).await
 }
 
 /// Ein einzelner Provider-Versuch.
@@ -910,6 +914,16 @@ fn log_stream_completion(
             error_message = em;
         }
 
+        // Fallback-Erkennung: das bedienende Target lieferte ein anderes
+        // Modell, als der Client anfragte (kein attempt-basierter Vergleich,
+        // das wuerde Multi-Provider-Primärrouten falsch markieren).
+        let requested_model = req_json
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let is_fallback = target.model_name != requested_model;
+
         let estimated_prompt = if prompt_tokens > 0 {
             prompt_tokens
         } else {
@@ -951,6 +965,13 @@ fn log_stream_completion(
                 cost_usd: cost,
                 duration_ms,
                 first_byte_ms,
+                is_fallback,
+                original_model: requested_model.clone(),
+                // attempts_made: der attempt-index steht hier nicht zur
+                // verfuegung (er liegt in der retry-loop von proxy(); ein
+                // Durchreichen wuerde execute_once + alle stream-funktionen
+                // beruehren) -> 0 = unbekannt.
+                attempts_made: 0,
             },
         });
 
@@ -988,6 +1009,10 @@ fn log_stream_completion(
             response_body,
             request_truncated: false,
             response_truncated: false,
+            is_fallback,
+            original_model: requested_model,
+            // wie im Live-Event: attempt-index hier nicht verfuegbar -> unbekannt
+            attempts_made: 0,
         };
         if log.cost_usd > 0.0 {
             state.track_spend(vk.id, log.cost_usd);
@@ -1393,7 +1418,15 @@ fn build_log(
     let error_message = outcome.log.error_message.clone();
     let error_type = outcome.log.error_type.clone();
     let first_byte_ms = outcome.log.first_byte_ms;
-    let _ = attempt;
+    // Fallback-Erkennung: das bedienende Target lieferte ein anderes Modell,
+    // als der Client anfragte.
+    let requested_model = req_json
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let is_fallback = target.model_name != requested_model;
+    let attempts_made = (attempt + 1) as u8;
 
     RequestLog {
         id: Uuid::new_v4(),
@@ -1421,6 +1454,9 @@ fn build_log(
         response_body,
         request_truncated: false,
         response_truncated: false,
+        is_fallback,
+        original_model: requested_model,
+        attempts_made,
     }
 }
 
@@ -1473,6 +1509,12 @@ fn build_log_from_response(
         response_body: serde_json::to_string(resp_json).unwrap_or_default(),
         request_truncated: false,
         response_truncated: false,
+        // Fallback-Felder bleiben Default: dieses Log ist nur der
+        // Zwischenträger für den outcome und wird nie persistiert — der
+        // persistierte Log kommt aus build_log mit den echten Werten.
+        is_fallback: false,
+        original_model: String::new(),
+        attempts_made: 0,
     }
 }
 
@@ -1503,6 +1545,9 @@ fn empty_log(_state: &AppState, _target: &RouteTarget, _endpoint: &str, _req_jso
         response_body: String::new(),
         request_truncated: false,
         response_truncated: false,
+        is_fallback: false,
+        original_model: String::new(),
+        attempts_made: 0,
     }
 }
 
@@ -1516,9 +1561,18 @@ async fn error_response(
     status: StatusCode,
     error_type: &str,
     message: &str,
+    // Anzahl der bisher versuchten Targets (0 = noch kein Provider-Versuch).
+    attempts_made: u8,
     req_body: &bytes::Bytes,
 ) -> Response {
     let duration_ms = started.elapsed().as_millis() as u64;
+    // original_model aus dem Request-Body parsen (best-effort, u.a. bei
+    // invalid_json leer): vermeidet einen Parameter an allen Call-Sites,
+    // die vor der Body-Auswertung abbrechen.
+    let original_model = serde_json::from_slice::<Value>(req_body)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+        .unwrap_or_default();
     let log = RequestLog {
         id: Uuid::new_v4(),
         request_id: request_id.to_string(),
@@ -1545,6 +1599,11 @@ async fn error_response(
         response_body: String::new(),
         request_truncated: false,
         response_truncated: false,
+        // Semantik: "bedient von Fallback" — hier ist kein Target bedient
+        // worden, daher immer false.
+        is_fallback: false,
+        original_model,
+        attempts_made,
     };
     state.log_sink.log(log);
 

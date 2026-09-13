@@ -562,6 +562,14 @@ export default function Overview() {
                 })}
               </p>
             )}
+            {stats && (stats.fallback_count ?? 0) > 0 && (
+              <p className="text-xs text-muted-foreground">
+                {t("via_fallback", {
+                  n: formatNumber(stats.fallback_count ?? 0),
+                  pct: formatPercent((stats.fallback_rate ?? 0) * 100, locale),
+                })}
+              </p>
+            )}
           </CardContent>
         </Card>
         <Card>

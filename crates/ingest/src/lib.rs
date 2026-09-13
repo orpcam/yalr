@@ -45,6 +45,14 @@ pub struct RequestLog {
     pub response_body: String,
     pub request_truncated: bool,
     pub response_truncated: bool,
+    /// Bedient durch Fallback: der bedienende Target hat ein anderes Modell
+    /// geliefert, als der Client angefragt hatte.
+    pub is_fallback: bool,
+    /// Vom Client angefordertes Modell (vor Routing/Fallback).
+    pub original_model: String,
+    /// Anzahl der Target-Versuche bis zum bedienenden Target (0 = unbekannt,
+    /// z.B. Alt-Daten oder Stream-Pfade ohne Attempt-Kontext).
+    pub attempts_made: u8,
 }
 
 /// Reduzierter Log-Eintrag fuer Live-Events (ohne Bodies, um Payload klein zu halten).
@@ -67,6 +75,9 @@ pub struct LiveLog {
     pub cost_usd: f64,
     pub duration_ms: u64,
     pub first_byte_ms: u64,
+    pub is_fallback: bool,
+    pub original_model: String,
+    pub attempts_made: u8,
 }
 
 impl From<&RequestLog> for LiveLog {
@@ -89,6 +100,9 @@ impl From<&RequestLog> for LiveLog {
             cost_usd: log.cost_usd,
             duration_ms: log.duration_ms,
             first_byte_ms: log.first_byte_ms,
+            is_fallback: log.is_fallback,
+            original_model: log.original_model.clone(),
+            attempts_made: log.attempts_made,
         }
     }
 }
@@ -577,6 +591,9 @@ pub async fn ensure_schema(client: &clickhouse::Client) -> anyhow::Result<()> {
                 response_body String DEFAULT '',
                 request_truncated  Bool DEFAULT false,
                 response_truncated Bool DEFAULT false,
+                is_fallback       Bool DEFAULT false,
+                original_model    LowCardinality(String) DEFAULT '',
+                attempts_made     UInt8 DEFAULT 0,
                 provider_id   Nullable(UUID)
             )
             ENGINE = MergeTree
@@ -601,6 +618,18 @@ pub async fn ensure_schema(client: &clickhouse::Client) -> anyhow::Result<()> {
         .await?;
     client
         .query("ALTER TABLE yalr.request_logs ADD COLUMN IF NOT EXISTS provider_id Nullable(UUID)")
+        .execute()
+        .await?;
+    client
+        .query("ALTER TABLE yalr.request_logs ADD COLUMN IF NOT EXISTS is_fallback Bool DEFAULT false")
+        .execute()
+        .await?;
+    client
+        .query("ALTER TABLE yalr.request_logs ADD COLUMN IF NOT EXISTS original_model LowCardinality(String) DEFAULT ''")
+        .execute()
+        .await?;
+    client
+        .query("ALTER TABLE yalr.request_logs ADD COLUMN IF NOT EXISTS attempts_made UInt8 DEFAULT 0")
         .execute()
         .await?;
     Ok(())
@@ -649,6 +678,9 @@ mod tests {
             response_body: "{}".into(),
             request_truncated: false,
             response_truncated: false,
+            is_fallback: false,
+            original_model: "gpt-4o".into(),
+            attempts_made: 1,
         };
         sink.log(entry);
         assert!(rx.try_recv().is_ok());
@@ -682,6 +714,9 @@ mod tests {
             response_body: "b".repeat(50),
             request_truncated: false,
             response_truncated: false,
+            is_fallback: false,
+            original_model: String::new(),
+            attempts_made: 0,
         };
 
         let truncated = truncate_bodies(entry, 60);
@@ -727,6 +762,9 @@ mod tests {
             response_body: String::new(),
             request_truncated: false,
             response_truncated: false,
+            is_fallback: false,
+            original_model: String::new(),
+            attempts_made: 0,
         };
         let truncated = truncate_bodies(entry, 7);
         assert!(truncated.request_truncated);
@@ -762,6 +800,9 @@ mod tests {
             response_body: String::new(),
             request_truncated: false,
             response_truncated: false,
+            is_fallback: false,
+            original_model: String::new(),
+            attempts_made: 0,
         }
     }
 
@@ -1050,6 +1091,9 @@ mod tests {
                 cost_usd: 0.001,
                 duration_ms: 200,
                 first_byte_ms: 50,
+                is_fallback: false,
+                original_model: "gpt-4o".into(),
+                attempts_made: 1,
             },
         }
     }

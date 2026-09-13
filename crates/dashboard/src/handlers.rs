@@ -1572,7 +1572,7 @@ pub async fn list_logs(
         where_clauses.push("provider = ?".to_string());
     }
     if q.model.is_some() {
-        where_clauses.push("model = ?".to_string());
+        where_clauses.push("(model = ? OR original_model = ?)".to_string());
     }
     if q.status.is_some() {
         where_clauses.push("status = ?".to_string());
@@ -1583,7 +1583,7 @@ pub async fn list_logs(
     let sql = format!(
         r#"
         SELECT id, request_id, timestamp, key_name, provider, provider_name, provider_id,
-               model, upstream_model, endpoint, status, error_type, is_stream,
+               model, original_model, attempts_made, is_fallback, upstream_model, endpoint, status, error_type, is_stream,
                prompt_tokens, completion_tokens, cost_usd, duration_ms, first_byte_ms
         FROM yalr.request_logs
         WHERE {where_sql}
@@ -1610,7 +1610,8 @@ pub async fn list_logs(
         query = query.bind(provider.clone());
     }
     if let Some(model) = &q.model {
-        query = query.bind(model.clone());
+        // Filter "(model = ? OR original_model = ?)" -> zwei Binds pro Filter
+        query = query.bind(model.clone()).bind(model.clone());
     }
     if let Some(status) = &q.status {
         query = query.bind(status);
@@ -1624,7 +1625,7 @@ pub async fn list_logs(
         count_query = count_query.bind(provider.clone());
     }
     if let Some(model) = &q.model {
-        count_query = count_query.bind(model.clone());
+        count_query = count_query.bind(model.clone()).bind(model.clone());
     }
     if let Some(status) = &q.status {
         count_query = count_query.bind(status);
@@ -1643,6 +1644,9 @@ pub async fn list_logs(
         #[serde(with = "clickhouse::serde::uuid::option")]
         provider_id: Option<Uuid>,
         model: String,
+        original_model: String,
+        attempts_made: u8,
+        is_fallback: bool,
         upstream_model: String,
         endpoint: String,
         status: u16,
@@ -1683,6 +1687,9 @@ pub async fn list_logs(
                             .unwrap_or(r.provider_name.clone()),
                         "provider_id": r.provider_id,
                         "model": r.model,
+                        "original_model": r.original_model,
+                        "attempts_made": r.attempts_made,
+                        "is_fallback": r.is_fallback,
                         "upstream_model": r.upstream_model,
                         "endpoint": r.endpoint,
                         "status": r.status,
@@ -1731,6 +1738,9 @@ pub async fn get_log(
         #[serde(with = "clickhouse::serde::uuid::option")]
         provider_id: Option<Uuid>,
         model: String,
+        original_model: String,
+        attempts_made: u8,
+        is_fallback: bool,
         upstream_model: String,
         endpoint: String,
         status: u16,
@@ -1754,7 +1764,7 @@ pub async fn get_log(
         .query(
             r#"
             SELECT id, request_id, timestamp, key_name, provider, provider_name, provider_id,
-                   model, upstream_model, endpoint, status, error_message, error_type,
+                   model, original_model, attempts_made, is_fallback, upstream_model, endpoint, status, error_message, error_type,
                    is_stream, prompt_tokens, completion_tokens, cost_usd,
                    duration_ms, first_byte_ms, request_body, response_body,
                    request_truncated, response_truncated
@@ -1870,7 +1880,7 @@ pub async fn stats(
         where_clauses.push("provider = ?".to_string());
     }
     if q.model.is_some() {
-        where_clauses.push("model = ?".to_string());
+        where_clauses.push("(model = ? OR original_model = ?)".to_string());
     }
     let where_sql = if where_clauses.is_empty() {
         String::new()
@@ -1887,7 +1897,10 @@ pub async fn stats(
             sum(cost_usd) AS total_cost,
             sum(prompt_tokens) AS total_prompt_tokens,
             sum(completion_tokens) AS total_completion_tokens,
-            sum(duration_ms) / greatest(count(), 1) AS avg_duration_ms
+            sum(duration_ms) / greatest(count(), 1) AS avg_duration_ms,
+            countIf(is_fallback) AS fallback_count,
+            toFloat64(countIf(is_fallback AND status >= 200 AND status < 300))
+                / greatest(countIf(status >= 200 AND status < 300), 1) AS fallback_rate
         FROM yalr.request_logs
         {where_sql}
         "#
@@ -1904,7 +1917,8 @@ pub async fn stats(
         query = query.bind(provider.clone());
     }
     if let Some(model) = &q.model {
-        query = query.bind(model.clone());
+        // Filter "(model = ? OR original_model = ?)" -> zwei Binds pro Filter
+        query = query.bind(model.clone()).bind(model.clone());
     }
 
     #[derive(clickhouse::Row, serde::Serialize, serde::Deserialize)]
@@ -1916,6 +1930,8 @@ pub async fn stats(
         total_prompt_tokens: u64,
         total_completion_tokens: u64,
         avg_duration_ms: f64,
+        fallback_count: u64,
+        fallback_rate: f64,
     }
 
     match query.fetch_one::<StatsRow>().await {
@@ -1979,7 +1995,7 @@ pub async fn timeseries(
                 min_clauses.push("provider = ?".to_string());
             }
             if q.model.is_some() {
-                min_clauses.push("model = ?".to_string());
+                min_clauses.push("(model = ? OR original_model = ?)".to_string());
             }
             let min_where = if min_clauses.is_empty() {
                 String::new()
@@ -1997,7 +2013,8 @@ pub async fn timeseries(
                 min_query = min_query.bind(provider.clone());
             }
             if let Some(model) = &q.model {
-                min_query = min_query.bind(model.clone());
+                // Filter "(model = ? OR original_model = ?)" -> zwei Binds pro Filter
+                min_query = min_query.bind(model.clone()).bind(model.clone());
             }
             let min_row = match min_query.fetch_one::<MinRow>().await {
                 Ok(r) => r,
@@ -2028,7 +2045,7 @@ pub async fn timeseries(
         where_clauses.push("provider = ?".to_string());
     }
     if q.model.is_some() {
-        where_clauses.push("model = ?".to_string());
+        where_clauses.push("(model = ? OR original_model = ?)".to_string());
     }
     let where_sql = if where_clauses.is_empty() {
         String::new()
@@ -2066,7 +2083,8 @@ pub async fn timeseries(
         query = query.bind(provider.clone());
     }
     if let Some(model) = &q.model {
-        query = query.bind(model.clone());
+        // Filter "(model = ? OR original_model = ?)" -> zwei Binds pro Filter
+        query = query.bind(model.clone()).bind(model.clone());
     }
 
     #[derive(clickhouse::Row, serde::Serialize, serde::Deserialize)]
