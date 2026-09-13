@@ -2499,6 +2499,102 @@ static UPSTREAM_SCRAPE_CACHE: once_cell::sync::Lazy<
     tokio::sync::Mutex<Option<UpstreamScrapeCacheValue>>,
 > = once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(None));
 
+/// Baseline- und Rate-Zustand pro Upstream-Provider (Uuid) fuer die
+/// serverseitig berechneten Token-Raten im on-demand-Scrape-Pfad.
+/// Gen- und Prompt-Baseline unabhaengig; last_rates werden bis zum
+/// naechsten echt neueren Sample wiederholt.
+#[derive(Clone)]
+struct UpstreamRateState {
+    /// (fetched_at, prompt_tokens_total) der letzten gueltigen Baseline
+    prompt_baseline: Option<(std::time::Instant, f64)>,
+    /// (fetched_at, gen_tokens_total) der letzten gueltigen Baseline
+    gen_baseline: Option<(std::time::Instant, f64)>,
+    /// zuletzt berechnete Prefill-Rate (token/s); None = noch keine
+    prefill_tps: Option<f64>,
+    /// zuletzt berechnete Decode-Rate (token/s); None = noch keine
+    decode_tps: Option<f64>,
+    /// Sample-Abstand in Sekunden des zuletzt gemessenen Decode-Fensters
+    decode_window: Option<f64>,
+}
+
+/// Letzter Rate-Zustand pro Provider (Uuid) fuer den on-demand-Scrape-Pfad.
+/// Getrennt von PREV_SAMPLES / UPSTREAM_SCRAPE_CACHE; Lock nur kurz halten
+/// (kein .await in der kritischen Sektion).
+static UPSTREAM_RATE_BASELINES: once_cell::sync::Lazy<
+    tokio::sync::Mutex<HashMap<Uuid, UpstreamRateState>>,
+> = once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+/// Reine Kernfunktion: faehrt den Upstream-Rate-Zustand eines Providers
+/// mit einem aktuellen Scrape-Sample voran. Keine Statics, voll testbar.
+///
+/// Regeln (provider_id-matching erfolgt auerhalb; hier nur Counter-Logik):
+/// - Nur wenn cur.fetched_at NEUER als die jeweilige Counter-Baseline:
+///   dieser Counter wird verarbeitet. Identischer/aelterer Sample: Baseline
+///   und last_rates unveraendert (verhindert Fake-0 und TTL-Kanten-Race).
+/// - Pro Counter unabhaengig: fehlender Counter (None) haelt die alte
+///   Baseline, der andere ruckt normal.
+/// - Reset (diff < 0) -> Rate None, Baseline trotzdem auf cur setzen;
+///   last_rates dieses Counters -> None (sonst Rate nach Restart tot).
+/// - MIN_ELAPSED-Floor (<1s) -> Rate None, Baseline fortschreiben,
+///   last_rates unveraendert (transient, selbstheilend).
+/// - Kaltstart (keine Baseline) -> Baseline seeden, Rate None.
+fn advance_rate_state(
+    old: Option<&UpstreamRateState>,
+    cur: &ProviderMetricsEntry,
+) -> UpstreamRateState {
+    let mut s = old.cloned().unwrap_or(UpstreamRateState {
+        prompt_baseline: None,
+        gen_baseline: None,
+        prefill_tps: None,
+        decode_tps: None,
+        decode_window: None,
+    });
+    let now = cur.fetched_at;
+
+    // Prefill (Prompt-Counter)
+    if let Some(v) = cur.prompt_tokens_total {
+        match s.prompt_baseline {
+            None => s.prompt_baseline = Some((now, v)), // Kaltstart
+            Some((bt, bv)) if now > bt => {
+                let rate = common::metrics::counter_delta_rate(Some((&bt, bv)), v, now);
+                s.prompt_baseline = Some((now, v));
+                match rate {
+                    Some(r) => s.prefill_tps = Some(r),
+                    None if v < bv => s.prefill_tps = None, // Reset
+                    None => {} // MIN_ELAPSED: Rate unveraendert
+                }
+            }
+            _ => {} // identisch/aelter: unveraendert
+        }
+    }
+
+    // Decode (Generation-Counter)
+    if let Some(v) = cur.gen_tokens_total {
+        match s.gen_baseline {
+            None => s.gen_baseline = Some((now, v)), // Kaltstart
+            Some((bt, bv)) if now > bt => {
+                let rate = common::metrics::counter_delta_rate(Some((&bt, bv)), v, now);
+                s.gen_baseline = Some((now, v));
+                match rate {
+                    Some(r) => {
+                        s.decode_tps = Some(r);
+                        s.decode_window = Some(now.duration_since(bt).as_secs_f64());
+                    }
+                    None if v < bv => {
+                        // Reset: Decode-Rate und Fenster toten
+                        s.decode_tps = None;
+                        s.decode_window = None;
+                    }
+                    None => {} // MIN_ELAPSED: Rate/Fenster unveraendert
+                }
+            }
+            _ => {} // identisch/aelter: unveraendert
+        }
+    }
+
+    s
+}
+
 /// Liefert die Provider-/metrics-Eintraege fuer den on-demand-Scrape mit
 /// 1s-Cache. Cache frisch (<1s) -> geklonter Cache-Stand; sonst frischer
 /// Fetch. PG-Fehler -> leerer Vec (debug statt warn: laeuft pro Scrape,
@@ -3223,6 +3319,7 @@ pub fn render_upstream_exposition(groups: &[UpstreamGroup], providers_enabled: u
 /// Upstream-Sektion).
 fn render_upstream_token_counters(
     entries: &[(String, ProviderMetricsEntry)],
+    rates: &[(Uuid, UpstreamRateState)],
 ) -> String {
     let mut body = String::new();
     if entries.is_empty() {
@@ -3230,6 +3327,10 @@ fn render_upstream_token_counters(
     }
     let mut sorted: Vec<&(String, ProviderMetricsEntry)> = entries.iter().collect();
     sorted.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // Rate-State-Lookup nach provider_id (für die Gauge-Familien unten)
+    let rate_map: HashMap<Uuid, &UpstreamRateState> =
+        rates.iter().map(|(id, st)| (*id, st)).collect();
 
     body.push_str(
         "# HELP yalr_upstream_prompt_tokens_total Prompt tokens sampled at scrape time from the provider /metrics endpoint (vllm/sglang raw engine counters, summed over labeled series)\n",
@@ -3261,10 +3362,65 @@ fn render_upstream_token_counters(
         }
     }
 
+    // Serverseitig berechnete Prefill-Rate (Gauge) aus dem Scrape-Pfad
+    body.push_str(
+        "# HELP yalr_upstream_prefill_tps Prefill-Durchsatz des Providers: Delta der Engine-Prompt-Counter zwischen den zwei jüngsten Engine-Samples, die der Scrape-Pfad gesehen hat, geteilt durch den Sample-Abstand. Wird bis zum nächsten neueren Sample wiederholt.\n",
+    );
+    body.push_str("# TYPE yalr_upstream_prefill_tps gauge\n");
+    for (name, e) in &sorted {
+        if let Some(st) = rate_map.get(&e.provider_id) {
+            if let Some(v) = st.prefill_tps {
+                body.push_str(&format!(
+                    "yalr_upstream_prefill_tps{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+                    escape_label(&e.kind),
+                    escape_label(name),
+                    fmt_f64(v)
+                ));
+            }
+        }
+    }
+
+    // Serverseitig berechnete Decode-Rate (Gauge) aus dem Scrape-Pfad
+    body.push_str(
+        "# HELP yalr_upstream_decode_tps Decode-Durchsatz des Providers: Delta der Engine-Generation-Counter zwischen den zwei jüngsten Engine-Samples, die der Scrape-Pfad gesehen hat, geteilt durch den Sample-Abstand. Wird bis zum nächsten neueren Sample wiederholt.\n",
+    );
+    body.push_str("# TYPE yalr_upstream_decode_tps gauge\n");
+    for (name, e) in &sorted {
+        if let Some(st) = rate_map.get(&e.provider_id) {
+            if let Some(v) = st.decode_tps {
+                body.push_str(&format!(
+                    "yalr_upstream_decode_tps{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+                    escape_label(&e.kind),
+                    escape_label(name),
+                    fmt_f64(v)
+                ));
+            }
+        }
+    }
+
+    // Decode-Fenster (Gauge): Sample-Abstand des zuletzt gemessenen Decode-Fensters
+    body.push_str(
+        "# HELP yalr_upstream_rate_window_seconds Sample-Abstand in Sekunden, über den die aktuelle Decode-Rate gemessen wurde. Macht das Messfenster sichtbar (poll-taktabhängig).\n",
+    );
+    body.push_str("# TYPE yalr_upstream_rate_window_seconds gauge\n");
+    for (name, e) in &sorted {
+        if let Some(st) = rate_map.get(&e.provider_id) {
+            if st.decode_tps.is_some() {
+                if let Some(v) = st.decode_window {
+                    body.push_str(&format!(
+                        "yalr_upstream_rate_window_seconds{{provider=\"{}\", provider_name=\"{}\"}} {}\n",
+                        escape_label(&e.kind),
+                        escape_label(name),
+                        fmt_f64(v)
+                    ));
+                }
+            }
+        }
+    }
+
     body
 }
 
-/// Rendert die aktuell in-flight laufenden Requests pro (provider, provider_name).
 /// Wird on-demand im metrics_handler gerendert (scrape-aktuell, kein Snapshot).
 pub fn render_in_flight_exposition(in_flight: &[ingest::InFlightReq]) -> String {
     let mut counts: std::collections::BTreeMap<(String, String), u64> =
@@ -3640,9 +3796,38 @@ pub async fn metrics_handler(State(state): State<AppState>, headers: HeaderMap) 
     let counter_part = render_counter_exposition(&entries, auth_failures, dropped);
     // Upstream-Engine-Counter (on-demand, 1s-Scrape-Cache): PG-Fehler laesst
     // die Sektion leer (debug, da pro Scrape).
-    let upstream_counter_part = render_upstream_token_counters(
-        &upstream_scrape_entries(&state).await,
-    );
+    let entries = upstream_scrape_entries(&state).await;
+    // Rate-Baselines fortschreiben: Lock wird nur kurz zum Map-Read/-Write
+    // gehalten, advance_rate_state laeuft sync auerhalb der kritischen Sektion.
+    let rates: Vec<(Uuid, UpstreamRateState)> = {
+        let mut old_states = HashMap::new();
+        {
+            let map = UPSTREAM_RATE_BASELINES.lock().await;
+            for (_, e) in &entries {
+                if !e.provider_id.is_nil() {
+                    if let Some(st) = map.get(&e.provider_id) {
+                        old_states.insert(e.provider_id, st.clone());
+                    }
+                }
+            }
+        }
+        let mut rates = Vec::new();
+        for (_, e) in &entries {
+            if e.provider_id.is_nil() {
+                continue; // kein Rate-Tracking ohne provider_id
+            }
+            let old = old_states.get(&e.provider_id);
+            rates.push((e.provider_id, advance_rate_state(old, e)));
+        }
+        {
+            let mut map = UPSTREAM_RATE_BASELINES.lock().await;
+            for (id, st) in &rates {
+                map.insert(*id, st.clone());
+            }
+        }
+        rates
+    };
+    let upstream_counter_part = render_upstream_token_counters(&entries, &rates);
     // Sektionen in fester Reihenfolge: Latenz (24h), Live (60s), Upstream,
     // Upstream-Counter (on-demand), Snapshot-Metadaten, on-demand In-Flight,
     // kumulative Counter.
@@ -4004,6 +4189,30 @@ mod metrics_tests {
         assert!(pos("yalr_clickhouse_up") < pos("yalr_in_flight_requests"));
         assert!(pos("yalr_in_flight_requests") < pos("yalr_requests_total"));
 
+        // Die drei neuen Gauge-Familien sitzen innerhalb der On-Demand-
+        // Upstream-Counter-Sektion, nach den Counter-Familien.
+        const SAMPLE: &str = r#"yalr_upstream_prompt_tokens_total{provider="p"} 5
+yalr_upstream_generation_tokens_total{provider="p"} 7
+yalr_upstream_prefill_tps{provider="p"} 20
+yalr_upstream_decode_tps{provider="p"} 10
+yalr_upstream_rate_window_seconds{provider="p"} 2.5
+"#;
+        let body = super::compose_metrics_body(
+            "",
+            "",
+            "",
+            SAMPLE,
+            "yalr_clickhouse_up 1\n",
+            "",
+            "yalr_requests_total 4\n",
+        );
+        let pos2 = |s: &str| body.find(s).expect("Sektion fehlt");
+        assert!(pos2("yalr_upstream_prompt_tokens_total") < pos2("yalr_upstream_prefill_tps"));
+        assert!(pos2("yalr_upstream_generation_tokens_total") < pos2("yalr_upstream_prefill_tps"));
+        assert!(pos2("yalr_upstream_prefill_tps") < pos2("yalr_upstream_decode_tps"));
+        assert!(pos2("yalr_upstream_decode_tps") < pos2("yalr_upstream_rate_window_seconds"));
+        assert!(pos2("yalr_upstream_rate_window_seconds") < pos2("yalr_clickhouse_up"));
+
         // leere Sektionen: Rest unveraendert in richtiger Reihenfolge
         let body = super::compose_metrics_body(
             "", "", "", "", "yalr_clickhouse_up 1\n", "", "yalr_requests_total 4\n",
@@ -4012,8 +4221,8 @@ mod metrics_tests {
     }
 
     /// Test-Doppel: Entry nur mit den fuer die Upstream-Counter relevanten
-    /// Feldern befuellt (provider_id/fetched_at sind fuer das Rendering
-    /// irrelevant).
+    /// Feldern befuellt (provider_id/fetched_at sind fuer das reine
+    /// Counter-Rendering irrelevant).
     fn upstream_entry(kind: &str, gen: Option<f64>, prompt: Option<f64>) -> super::ProviderMetricsEntry {
         super::ProviderMetricsEntry {
             provider_id: uuid::Uuid::nil(),
@@ -4032,10 +4241,51 @@ mod metrics_tests {
         }
     }
 
+    /// Test-Doppel mit explizitem provider_id und fetched_at.
+    fn upstream_entry_id(
+        id: uuid::Uuid,
+        kind: &str,
+        gen: Option<f64>,
+        prompt: Option<f64>,
+        fetched_at: std::time::Instant,
+    ) -> super::ProviderMetricsEntry {
+        super::ProviderMetricsEntry {
+            provider_id: id,
+            kind: kind.to_string(),
+            metrics_url: None,
+            queued: None,
+            running: None,
+            kv_cache_usage: None,
+            decode_tps: None,
+            decode_tps_live: None,
+            prefill_tps_live: None,
+            gen_tokens_total: gen,
+            prompt_tokens_total: prompt,
+            fetched_at,
+            fetch_ok: true,
+        }
+    }
+
+    fn rate_state(
+        prompt_baseline: Option<(std::time::Instant, f64)>,
+        gen_baseline: Option<(std::time::Instant, f64)>,
+        prefill_tps: Option<f64>,
+        decode_tps: Option<f64>,
+        decode_window: Option<f64>,
+    ) -> super::UpstreamRateState {
+        super::UpstreamRateState {
+            prompt_baseline,
+            gen_baseline,
+            prefill_tps,
+            decode_tps,
+            decode_window,
+        }
+    }
+
     #[test]
     fn test_render_upstream_token_counters() {
         // leerer Input -> leerer String (auch keine HELP/TYPE-Zeilen)
-        assert_eq!(super::render_upstream_token_counters(&[]), "");
+        assert_eq!(super::render_upstream_token_counters(&[], &[]), "");
 
         // normales Rendering: beide Familien, Labels, stabile Reihenfolge
         // (absteigend nach provider_name), Zahlen via fmt_f64
@@ -4043,7 +4293,7 @@ mod metrics_tests {
             ("Alpha".to_string(), upstream_entry("openai_compat", Some(100.0), Some(50.5))),
             ("Beta".to_string(), upstream_entry("openai_compat", Some(7.0), Some(3.0))),
         ];
-        let body = super::render_upstream_token_counters(&entries);
+        let body = super::render_upstream_token_counters(&entries, &[]);
         assert!(body.contains(
             "# HELP yalr_upstream_prompt_tokens_total Prompt tokens sampled at scrape time from the provider /metrics endpoint (vllm/sglang raw engine counters, summed over labeled series)"
         ));
@@ -4077,7 +4327,7 @@ mod metrics_tests {
             "Gamma".to_string(),
             upstream_entry("openai_compat", None, Some(42.0)),
         )];
-        let body = super::render_upstream_token_counters(&entries);
+        let body = super::render_upstream_token_counters(&entries, &[]);
         assert!(!body.contains("generation_tokens_total{"));
         assert!(!body.contains("NaN"));
         assert!(body.contains(
@@ -4089,10 +4339,217 @@ mod metrics_tests {
             "Bad\"Name\nB".to_string(),
             upstream_entry("p\\k", Some(1.0), None),
         )];
-        let body = super::render_upstream_token_counters(&entries);
+        let body = super::render_upstream_token_counters(&entries, &[]);
         assert!(body.contains(r##"yalr_upstream_generation_tokens_total{provider="p\\k", provider_name="Bad\"Name\nB"} 1"##));
         assert!(!body.contains("Bad\"Name"));
     }
+
+    #[test]
+    fn test_render_upstream_token_counters_rates() {
+        let id_a = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let id_b = uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let t = std::time::Instant::now();
+        let entries = vec![
+            ("Alpha".to_string(), upstream_entry_id(id_a, "openai_compat", Some(100.0), Some(50.0), t)),
+            ("Beta".to_string(), upstream_entry_id(id_b, "openai_compat", Some(7.0), Some(3.0), t)),
+        ];
+        // Alpha hat Raten, Beta keine -> Beta-Serien komplett abwesend
+        let rates = vec![
+            (id_a, rate_state(None, None, Some(20.0), Some(10.0), Some(3.5))),
+            (id_b, rate_state(None, None, Some(4.0), None, Some(1.0))),
+        ];
+        let body = super::render_upstream_token_counters(&entries, &rates);
+        // alle drei Gauge-Familien mit HELP/TYPE vorhanden
+        assert!(body.contains("# HELP yalr_upstream_prefill_tps Prefill-Durchsatz des Providers: "));
+        assert!(body.contains("# TYPE yalr_upstream_prefill_tps gauge"));
+        assert!(body.contains("# HELP yalr_upstream_decode_tps Decode-Durchsatz des Providers: "));
+        assert!(body.contains("# TYPE yalr_upstream_decode_tps gauge"));
+        assert!(body.contains("# HELP yalr_upstream_rate_window_seconds Sample-Abstand in Sekunden, \u{00fc}ber den die aktuelle Decode-Rate gemessen wurde."));
+        assert!(body.contains("# TYPE yalr_upstream_rate_window_seconds gauge"));
+        // Alpha-Serien vorhanden
+        assert!(body.contains(
+            "yalr_upstream_prefill_tps{provider=\"openai_compat\", provider_name=\"Alpha\"} 20"
+        ));
+        assert!(body.contains(
+            "yalr_upstream_decode_tps{provider=\"openai_compat\", provider_name=\"Alpha\"} 10"
+        ));
+        assert!(body.contains(
+            "yalr_upstream_rate_window_seconds{provider=\"openai_compat\", provider_name=\"Alpha\"} 3.5"
+        ));
+        // Beta: prefill_tps vorhanden (4.0), decode_tps None -> keine
+        // decode-Serie und kein Window (auch wenn decode_window Some waere)
+        assert!(body.contains(
+            "yalr_upstream_prefill_tps{provider=\"openai_compat\", provider_name=\"Beta\"} 4"
+        ));
+        assert!(!body.contains("decode_tps{provider=\"openai_compat\", provider_name=\"Beta\"}"));
+        assert!(!body.contains("rate_window_seconds{provider=\"openai_compat\", provider_name=\"Beta\"}"));
+        assert!(!body.contains("NaN"));
+        // Position: die Gauge-Familien folgen auf die Counter-Familien
+        let pos = |s: &str| body.find(s).expect("Familie fehlt");
+        assert!(pos("yalr_upstream_prompt_tokens_total{") < pos("# HELP yalr_upstream_prefill_tps "));
+        assert!(pos("yalr_upstream_generation_tokens_total{") < pos("# HELP yalr_upstream_prefill_tps "));
+        assert!(pos("# TYPE yalr_upstream_prefill_tps gauge") < pos("yalr_upstream_prefill_tps{"));
+        assert!(pos("# HELP yalr_upstream_prefill_tps ") < pos("# HELP yalr_upstream_decode_tps "));
+        assert!(pos("# HELP yalr_upstream_decode_tps ") < pos("# HELP yalr_upstream_rate_window_seconds "));
+
+        // Label-Escaping auch in den Rate-Familien
+        let id_c = uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let entries = vec![("Bad\"Name\nB".to_string(), upstream_entry_id(id_c, "p\\k", Some(1.0), None, t))];
+        let rates = vec![(id_c, rate_state(None, None, Some(1.5), None, None))];
+        let body = super::render_upstream_token_counters(&entries, &rates);
+        assert!(body.contains(r##"yalr_upstream_prefill_tps{provider="p\\k", provider_name="Bad\"Name\nB"} 1.5"##));
+        assert!(!body.contains("Bad\"Name"));
+
+        // leerer Input -> leerer String (auch ohne Rates)
+        assert_eq!(super::render_upstream_token_counters(&[], &[]), "");
+    }
+
+    #[test]
+    fn test_advance_rate_state_cold_start() {
+        let t = std::time::Instant::now();
+        let entry = upstream_entry_id(uuid::Uuid::nil(), "k", Some(100.0), Some(50.0), t);
+        let s = super::advance_rate_state(None, &entry);
+        // Baselines gesetzt, Raten None
+        assert_eq!(s.prompt_baseline, Some((t, 50.0)));
+        assert_eq!(s.gen_baseline, Some((t, 100.0)));
+        assert_eq!(s.prefill_tps, None);
+        assert_eq!(s.decode_tps, None);
+        assert_eq!(s.decode_window, None);
+    }
+
+    #[test]
+    fn test_advance_rate_state_newer_sample_computes_rates() {
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_secs(10);
+        let old = rate_state(Some((t0, 100.0)), Some((t0, 50.0)), None, None, None);
+        let entry = upstream_entry_id(uuid::Uuid::nil(), "k", Some(150.0), Some(300.0), t1);
+        let s = super::advance_rate_state(Some(&old), &entry);
+        // (300-100)/10s = 20, (150-50)/10s = 10, Fenster exakt 10s
+        assert_eq!(s.prefill_tps, Some(20.0));
+        assert_eq!(s.decode_tps, Some(10.0));
+        assert_eq!(s.decode_window, Some(10.0));
+        assert_eq!(s.prompt_baseline, Some((t1, 300.0)));
+        assert_eq!(s.gen_baseline, Some((t1, 150.0)));
+    }
+
+    #[test]
+    fn test_advance_rate_state_same_timestamp_repeats_rates_no_fake_zero() {
+        let t0 = std::time::Instant::now();
+        let old = rate_state(
+            Some((t0, 100.0)),
+            Some((t0, 50.0)),
+            Some(20.0),
+            Some(10.0),
+            Some(10.0),
+        );
+        // Identisches fetched_at, andere Counter-Werte: keine Neuberechnung
+        // (verhindert Fake-0 bei gleichem Timestamp / TTL-Kanten-Race).
+        let entry = upstream_entry_id(uuid::Uuid::nil(), "k", Some(999.0), Some(888.0), t0);
+        let s = super::advance_rate_state(Some(&old), &entry);
+        assert_eq!(s.prefill_tps, Some(20.0));
+        assert_eq!(s.decode_tps, Some(10.0));
+        assert_eq!(s.decode_window, Some(10.0));
+        // Baselines unveraendert
+        assert_eq!(s.prompt_baseline, Some((t0, 100.0)));
+        assert_eq!(s.gen_baseline, Some((t0, 50.0)));
+    }
+
+    #[test]
+    fn test_advance_rate_state_older_sample_unchanged() {
+        let t0 = std::time::Instant::now();
+        let t_old = t0 - std::time::Duration::from_secs(5);
+        let old = rate_state(
+            Some((t0, 100.0)),
+            Some((t0, 50.0)),
+            Some(20.0),
+            Some(10.0),
+            Some(10.0),
+        );
+        let entry = upstream_entry_id(uuid::Uuid::nil(), "k", Some(150.0), Some(300.0), t_old);
+        let s = super::advance_rate_state(Some(&old), &entry);
+        assert_eq!(s.prefill_tps, Some(20.0));
+        assert_eq!(s.decode_tps, Some(10.0));
+        assert_eq!(s.decode_window, Some(10.0));
+        assert_eq!(s.prompt_baseline, Some((t0, 100.0)));
+        assert_eq!(s.gen_baseline, Some((t0, 50.0)));
+    }
+
+    #[test]
+    fn test_advance_rate_state_reset_zeroes_rate_but_advances_baseline() {
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_secs(10);
+        let old = rate_state(
+            Some((t0, 100.0)),
+            Some((t0, 50.0)),
+            Some(20.0),
+            Some(10.0),
+            Some(10.0),
+        );
+        // Gen-Counter zurueckgesetzt (20 < 50) -> Reset.
+        // Prompt 400 statt 300, damit die neu berechnete Prefill-Rate
+        // (400-100)/10 = 30 sich vom alten Wert 20 unterscheidet — die
+        // Assertion waere sonst vaku (alt == neu berechnet).
+        let entry = upstream_entry_id(uuid::Uuid::nil(), "k", Some(20.0), Some(400.0), t1);
+        let s = super::advance_rate_state(Some(&old), &entry);
+        // Prefill normal neu berechnet: (400-100)/10 = 30
+        assert_eq!(s.prefill_tps, Some(30.0));
+        // Decode-Reset: Rate + Fenster None, Baseline auf den neuen Wert.
+        assert_eq!(s.decode_tps, None);
+        assert_eq!(s.decode_window, None);
+        assert_eq!(s.gen_baseline, Some((t1, 20.0)));
+        assert_eq!(s.prompt_baseline, Some((t1, 400.0)));
+    }
+
+    #[test]
+    fn test_advance_rate_state_one_counter_missing_only_other_advances() {
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_secs(10);
+        let old = rate_state(
+            Some((t0, 100.0)),
+            Some((t0, 50.0)),
+            Some(20.0),
+            Some(10.0),
+            Some(10.0),
+        );
+        // Nur Gen vorhanden, Prompt None -> nur Gen-Baseline rueckt.
+        // Gen 120 statt 150 und t1 20s statt 10s, damit die neu
+        // berechnete Decode-Rate (120-50)/20 = 3.5 und das Fenster 20
+        // sich vom alten Wert 10 unterscheiden — die Assertions waeren
+        // sonst vaku (alt == neu berechnet).
+        let t1 = t0 + std::time::Duration::from_secs(20);
+        let entry = upstream_entry_id(uuid::Uuid::nil(), "k", Some(120.0), None, t1);
+        let s = super::advance_rate_state(Some(&old), &entry);
+        // Prompt unveraendert (Baseline + Rate)
+        assert_eq!(s.prompt_baseline, Some((t0, 100.0)));
+        assert_eq!(s.prefill_tps, Some(20.0));
+        // Gen fortgeschritten und neu berechnet
+        assert_eq!(s.gen_baseline, Some((t1, 120.0)));
+        assert_eq!(s.decode_tps, Some(3.5));
+        assert_eq!(s.decode_window, Some(20.0));
+    }
+
+    #[test]
+    fn test_advance_rate_state_min_elapsed_keeps_rates_advances_baseline() {
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(500);
+        let old = rate_state(
+            Some((t0, 100.0)),
+            Some((t0, 50.0)),
+            Some(20.0),
+            Some(10.0),
+            Some(10.0),
+        );
+        // <1s -> MIN_ELAPSED-Floor: Rate wird nicht neu berechnet, Baseline
+        // wird fortgeschrieben, letzte Rates bleiben (transient).
+        let entry = upstream_entry_id(uuid::Uuid::nil(), "k", Some(150.0), Some(300.0), t1);
+        let s = super::advance_rate_state(Some(&old), &entry);
+        assert_eq!(s.prefill_tps, Some(20.0));
+        assert_eq!(s.decode_tps, Some(10.0));
+        assert_eq!(s.decode_window, Some(10.0));
+        assert_eq!(s.prompt_baseline, Some((t1, 300.0)));
+        assert_eq!(s.gen_baseline, Some((t1, 150.0)));
+    }
+
 
     #[test]
     fn test_rates_from_sums_guard() {
