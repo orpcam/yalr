@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { api, Provider, Model } from "@/lib/api";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -20,7 +21,7 @@ import { parseCapabilities } from "./capabilities";
 interface Props {
   providers: Provider[];
   models: Model[];
-  refresh: () => void;
+  refresh: () => Promise<void>;
 }
 
 export function ModelsSection({ providers, models, refresh }: Props) {
@@ -35,6 +36,7 @@ export function ModelsSection({ providers, models, refresh }: Props) {
   const [mCapabilities, setMCapabilities] = useState("");
 
   const [editingModelId, setEditingModelId] = useState<string | null>(null);
+  const [togglingModelId, setTogglingModelId] = useState<string | null>(null);
   const [editModel, setEditModel] = useState({
     provider_id: "",
     upstream_model: "",
@@ -124,6 +126,67 @@ export function ModelsSection({ providers, models, refresh }: Props) {
     }
   };
 
+  const toggleModelEnabled = async (m: Model) => {
+    if (togglingModelId) return;
+    setTogglingModelId(m.id);
+    try {
+      // Der Backend-Handler (update_model) setzt quantization/notes/link/
+      // capabilities unbedingt — die aktuellen Werte mitschicken, damit sie
+      // nicht ge-nullt werden.
+      await api.put(`/models/${m.id}`, {
+        enabled: !m.enabled,
+        quantization: m.quantization ?? null,
+        notes: m.notes ?? null,
+        link: m.link ?? null,
+        capabilities: m.capabilities ?? null,
+      });
+      await refresh();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : t("error_generic"));
+    } finally {
+      setTogglingModelId(null);
+    }
+  };
+
+  const statusBadge = (m: Model) => {
+    const label = `${m.model_name}: ${m.enabled ? t("deactivate") : t("activate")}`;
+
+    // In der Edit-Zeile nicht interaktiv: ein Toggle hier würde auf den
+    // Edit-State treffen, statt die Zeile umzuschalten.
+    if (editingModelId === m.id) {
+      return (
+        <Badge variant={m.enabled ? "success" : "error"} className="cursor-default opacity-60" title={label}>
+          {m.enabled ? t("active") : t("disabled")}
+        </Badge>
+      );
+    }
+
+    return (
+      <Badge
+        role="button"
+        tabIndex={0}
+        variant={m.enabled ? "success" : "error"}
+        className={
+          togglingModelId !== null
+            ? "cursor-wait opacity-60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            : "cursor-pointer hover:opacity-80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        }
+        title={label}
+        aria-label={label}
+        aria-pressed={m.enabled}
+        onClick={() => toggleModelEnabled(m)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            toggleModelEnabled(m);
+          }
+        }}
+      >
+        {m.enabled ? t("active") : t("disabled")}
+      </Badge>
+      );
+  };
+
   const removeModel = async (m: Model) => {
     const ok = await confirm({
       title: t("confirm_delete_model", { name: m.model_name }),
@@ -201,12 +264,13 @@ export function ModelsSection({ providers, models, refresh }: Props) {
 
         {error && <p className="text-sm text-destructive">{error}</p>}
 
-        <Table className="min-w-[768px] md:min-w-0">
+        <Table className="min-w-[864px] md:min-w-0">
           <TableHeader>
             <TableRow>
               <TableHead>{t("model")}</TableHead>
               <TableHead>{t("upstream_model")}</TableHead>
               <TableHead>{t("provider")}</TableHead>
+              <TableHead>{t("state")}</TableHead>
               <TableHead>{t("quantization")}</TableHead>
               <TableHead className="text-right">{t("input_price")}</TableHead>
               <TableHead className="text-right">{t("output_price")}</TableHead>
@@ -216,7 +280,7 @@ export function ModelsSection({ providers, models, refresh }: Props) {
           <TableBody>
             {models.length === 0 && (
               <TableRow>
-                <TableCell colSpan={7} className="p-6 text-center text-muted-foreground">
+                <TableCell colSpan={8} className="p-6 text-center text-muted-foreground">
                   {t("no_models")}
                 </TableCell>
               </TableRow>
@@ -266,6 +330,7 @@ export function ModelsSection({ providers, models, refresh }: Props) {
                       ))}
                     </Select>
                   </TableCell>
+                  <TableCell>{statusBadge(m)}</TableCell>
                   <TableCell>
                     <Input
                       className="h-7 w-full sm:w-20 px-2 py-0.5 text-xs"
@@ -337,6 +402,7 @@ export function ModelsSection({ providers, models, refresh }: Props) {
                   </TableCell>
                   <TableCell className="text-muted-foreground">{m.upstream_model}</TableCell>
                   <TableCell>{m.provider_name}</TableCell>
+                  <TableCell>{statusBadge(m)}</TableCell>
                   <TableCell>{m.quantization || "–"}</TableCell>
                   <TableCell className="text-right">${m.input_price_per_million}</TableCell>
                   <TableCell className="text-right">${m.output_price_per_million}</TableCell>
