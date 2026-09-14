@@ -22,6 +22,7 @@ import {
   type ProviderSample,
   type TrackedRequest,
 } from "@/lib/live";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Sparkline } from "@/components/Sparkline";
@@ -232,6 +233,8 @@ export default function Overview() {
         completion_tokens: log.completion_tokens,
         duration_ms: log.duration_ms,
         first_byte_ms: log.first_byte_ms,
+        is_fallback: log.is_fallback,
+        original_model: log.original_model,
       };
     });
     return () => es.close();
@@ -765,6 +768,15 @@ function LiveRequestRow({
             <>
               <span className="shrink-0 font-medium text-emerald-600 dark:text-emerald-400">{t("completed")}</span>
               <span className="min-w-0 max-w-56 truncate font-medium">{tr.entry.model}</span>
+              {c.is_fallback && (
+                <Badge
+                  variant="outline"
+                  className="shrink-0 whitespace-nowrap border-yellow-500 text-yellow-500"
+                  title={c.original_model ? `${c.original_model} → ${tr.entry.model}` : undefined}
+                >
+                  {t("fallback")}
+                </Badge>
+              )}
               <span className="min-w-0 max-w-32 truncate text-muted-foreground">{tr.entry.key_name}</span>
               <span className="shrink-0">
                 {t("prefill_tokens")}:{" "}

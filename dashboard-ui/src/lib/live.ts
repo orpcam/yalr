@@ -80,6 +80,8 @@ export interface CompletedInfo {
   completion_tokens: number;
   duration_ms: number;
   first_byte_ms: number | null;
+  is_fallback?: boolean;
+  original_model?: string;
 }
 
 /**
