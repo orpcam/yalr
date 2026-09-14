@@ -3,10 +3,11 @@ import { useProvidersData } from "./providers/useProvidersData";
 import { ProvidersSection } from "./providers/ProvidersSection";
 import { ModelsSection } from "./providers/ModelsSection";
 import { FallbacksSection } from "./providers/FallbacksSection";
+import { RedirectsSection } from "./providers/RedirectsSection";
 import { useLanguage } from "@/lib/i18n";
 
 export default function Providers() {
-  const { providers, models, fallbacks, load } = useProvidersData();
+  const { providers, models, fallbacks, redirects, load } = useProvidersData();
   const { t } = useLanguage();
 
   const modelNames = useMemo(
@@ -20,6 +21,7 @@ export default function Providers() {
       <ProvidersSection providers={providers} refresh={load} />
       <ModelsSection providers={providers} models={models} refresh={load} />
       <FallbacksSection fallbacks={fallbacks} modelNames={modelNames} refresh={load} />
+      <RedirectsSection redirects={redirects} modelNames={modelNames} refresh={load} />
     </div>
   );
 }

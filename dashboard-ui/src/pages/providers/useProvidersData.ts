@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, Provider, Model, Fallback } from "@/lib/api";
+import { api, Provider, Model, Fallback, Redirect } from "@/lib/api";
 import { useToast } from "@/components/ui/toast";
 import { useLanguage } from "@/lib/i18n";
 
 /**
- * Geteilte daten-quelle der providers-seite: laedt providers, models und
- * fallbacks und stellt ein reload bereit. Jede sektion (provider/modelle/
- * fallbacks) nutzt dieselben daten, hat aber eigene form-/fehler-zustaende.
+ * Geteilte daten-quelle der providers-seite: laedt providers, models,
+ * fallbacks und redirects und stellt ein reload bereit. Jede sektion
+ * (provider/modelle/fallbacks/redirects) nutzt dieselben daten, hat aber
+ * eigene form-/fehler-zustaende.
  */
 export function useProvidersData() {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [models, setModels] = useState<Model[]>([]);
   const [fallbacks, setFallbacks] = useState<Fallback[]>([]);
+  const [redirects, setRedirects] = useState<Redirect[]>([]);
   const toast = useToast();
   const { t } = useLanguage();
 
@@ -29,6 +31,10 @@ export function useProvidersData() {
         .get<{ fallbacks: Fallback[] }>("/fallbacks")
         .then((r) => setFallbacks(r.fallbacks))
         .catch((e) => toast.error(e instanceof Error ? e.message : t("load_failed"))),
+      api
+        .get<Redirect[]>("/redirects")
+        .then(setRedirects)
+        .catch((e) => toast.error(e instanceof Error ? e.message : t("load_failed"))),
     ]);
   }, [toast, t]);
 
@@ -36,5 +42,5 @@ export function useProvidersData() {
     load();
   }, [load]);
 
-  return { providers, models, fallbacks, load };
+  return { providers, models, fallbacks, redirects, load };
 }

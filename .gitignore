@@ -26,3 +26,6 @@ dist/
 PLAN.md
 AGENTS.md
 DEPLOY.md
+
+# Local agent config (never commit)
+.pi/

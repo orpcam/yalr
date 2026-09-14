@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import { api, Model, Redirect } from "@/lib/api";
+import { useState } from "react";
+import { api, Redirect } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -17,48 +17,19 @@ import { useToast } from "@/components/ui/toast";
 import { useConfirm } from "@/lib/confirm";
 import { useLanguage } from "@/lib/i18n";
 
-/**
- * Schlanker modell-abruf fuer die settings-seite: laedt nur die modellnamen
- * (derselbe endpunkt wie useProvidersData), ohne die providers-spezifischen
- * daten.
- */
-function useModelNames() {
-  const [modelNames, setModelNames] = useState<string[]>([]);
-  const toast = useToast();
-  const { t } = useLanguage();
-
-  useEffect(() => {
-    api
-      .get<{ models: Model[] }>("/models")
-      .then((r) => setModelNames([...new Set(r.models.map((m) => m.model_name))]))
-      .catch((e) => toast.error(e instanceof Error ? e.message : t("load_failed")));
-  }, [toast, t]);
-
-  return modelNames;
+interface Props {
+  redirects: Redirect[];
+  modelNames: string[];
+  refresh: () => void;
 }
 
-export function RedirectsSection() {
-  const [redirects, setRedirects] = useState<Redirect[]>([]);
+export function RedirectsSection({ redirects, modelNames, refresh }: Props) {
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [note, setNote] = useState("");
-  const modelNames = useModelNames();
   const { t, formatDateTime } = useLanguage();
   const toast = useToast();
   const confirm = useConfirm();
-
-  const load = useCallback(async (): Promise<void> => {
-    try {
-      setRedirects(await api.get<Redirect[]>("/redirects"));
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : t("load_failed"));
-    }
-  }, [toast, t]);
-
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- setState laeuft erst nach dem async fetch, nicht synchron im effect
-    void load();
-  }, [load]);
 
   const createRedirect = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -75,7 +46,7 @@ export function RedirectsSection() {
       setFrom("");
       setTo("");
       setNote("");
-      load();
+      refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t("error_generic"));
     }
@@ -94,7 +65,7 @@ export function RedirectsSection() {
     if (!ok) return;
     try {
       await api.del(`/redirects/${r.id}`);
-      load();
+      refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t("error_generic"));
     }

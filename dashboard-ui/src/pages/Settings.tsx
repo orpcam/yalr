@@ -5,7 +5,6 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label, Select } from "@/components/ui/select";
 import { useLanguage, useCurrency, LANGUAGES, CURRENCIES } from "@/lib/i18n";
-import { RedirectsSection } from "./settings/RedirectsSection";
 
 export default function Settings() {
   const [currentPassword, setCurrentPassword] = useState("");
@@ -108,8 +107,6 @@ export default function Settings() {
           </form>
         </CardContent>
       </Card>
-
-      <RedirectsSection />
 
       <Card className="max-w-md">
         <CardHeader>
