@@ -11,8 +11,9 @@ YALR is a self-hosted LLM gateway (similar to Helicone/LiteLLM) written in Rust:
   transparent format translation in both directions
 - **Streaming**: SSE streaming is passed through 1:1 (OpenAI) or translated
   live into the target format (Anthropic/Gemini → OpenAI chunks)
-- **Virtual Keys**: any number of named API keys with optional budgets;
-  requests can be filtered by key name in the dashboard
+- **Virtual Keys**: any number of named API keys with optional budgets and
+  optional scopes (allow-list of providers and/or model names; empty =
+  unrestricted); requests can be filtered by key name in the dashboard
 - **Fallbacks & Retries**: per-model fallback chains, automatic retries on
   transient errors (429/5xx/network)
 - **Temporary Redirects**: deliberate model reroutes (A → B) that always
@@ -85,6 +86,12 @@ anthropic | gemini | <provider-name>`.
 
 Budgets: a virtual key with a budget set receives `402 Payment Required` once
 the budget is exceeded. Spend is aggregated from ClickHouse and cached.
+
+Scopes: a virtual key with provider and/or model scopes receives
+`403 Forbidden` (error type `model_not_allowed` or `provider_not_allowed`)
+when a request targets a non-allowed model or no allowed provider serves
+it. `GET /v1/models` only lists models within the key's scope. Deleting a
+provider that is referenced in a key's scope is refused with `409`.
 
 ## Development (without Docker)
 

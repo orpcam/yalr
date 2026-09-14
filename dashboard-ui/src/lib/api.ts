@@ -57,6 +57,9 @@ export interface VirtualKey {
   created_at: string;
   last_used_at: string | null;
   key_hint?: string;
+  /** Allow-Liste: leer = unbeschränkt. Alt-Daten haben das Feld evtl. nicht. */
+  allowed_providers?: { id: string; name: string; kind: string }[];
+  allowed_models?: string[];
 }
 
 export interface Provider {

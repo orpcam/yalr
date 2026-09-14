@@ -88,6 +88,63 @@ fn resolve_failure(routing: &RoutingInfo, requested_model: &str) -> ResolveFailu
     }
 }
 
+/// Key-Scope-Check auf den ANGEFORDERTEN Modellnamen (Client-Sicht, vor dem
+/// Routing): deterministisches 403 unabhaengig von Redirects, kein Leak
+/// darueber, welche Modelle konfiguriert sind. Leere Allow-List = frei.
+fn model_scope_denied(allowed_models: &[String], requested_model: &str) -> bool {
+    !allowed_models.is_empty() && !allowed_models.iter().any(|m| m == requested_model)
+}
+
+/// Wendet den Key-Scope auf die aufgelöste Target-Liste an (nach Redirect).
+/// Leere Listen = unbeschränkt in der jeweiligen Dimension. Das effektive
+/// Modell (nach Redirect) bleibt bedienbar; Fallback-Ziele nur, wenn ihr
+/// Name explizit erlaubt ist. Liefert den 403-Fehlertyp, falls die Liste
+/// leer wird.
+fn apply_target_scope(
+    targets: &mut Vec<RouteTarget>,
+    allowed_providers: &[Uuid],
+    allowed_models: &[String],
+    effective_model: &str,
+) -> Option<&'static str> {
+    if !allowed_providers.is_empty() {
+        targets.retain(|t| allowed_providers.contains(&t.provider_id));
+    }
+    if !allowed_models.is_empty() {
+        targets.retain(|t| {
+            t.model_name == effective_model || allowed_models.contains(&t.model_name)
+        });
+    }
+    if targets.is_empty() {
+        return Some(if !allowed_providers.is_empty() {
+            "provider_not_allowed"
+        } else {
+            "model_not_allowed"
+        });
+    }
+    None
+}
+
+/// Key-gescopete Ansicht der Routentabelle fuer /v1/models: nur Namen, die
+/// die Modell-Allow-List erlauben UND zu denen mindestens ein Target mit
+/// erlaubter provider_id existiert (leere Listen = unbeschränkt, beide
+/// gesetzt = Schnittmenge).
+fn scoped_route_entries<'a>(
+    routes: &'a std::collections::HashMap<String, Vec<RouteTarget>>,
+    allowed_providers: &[Uuid],
+    allowed_models: &[String],
+) -> Vec<(&'a String, &'a Vec<RouteTarget>)> {
+    routes
+        .iter()
+        .filter(|(name, targets)| {
+            (allowed_models.is_empty() || allowed_models.contains(*name))
+                && (allowed_providers.is_empty()
+                    || targets
+                        .iter()
+                        .any(|t| allowed_providers.contains(&t.provider_id)))
+        })
+        .collect()
+}
+
 /// Behandelt `/v1/chat/completions`, `/v1/embeddings`, `/v1/messages` und `/v1/models`.
 pub async fn proxy(
     State(state): State<AppState>,
@@ -128,6 +185,13 @@ pub async fn proxy(
         return error_response(state, None, Some(&vk), &request_id, &endpoint, started, StatusCode::BAD_REQUEST, "missing_model", "request body has no 'model' field", 0, &body).await;
     }
 
+    // 2b) Key-Scope: Modell-Check auf den angeforderten Namen, VOR dem
+    //     Routing (s. model_scope_denied: kein Konfig-Leak, deterministisch)
+    if model_scope_denied(&vk.allowed_models, &requested_model) {
+        let msg = format!("model '{requested_model}' is not allowed for this key");
+        return error_response(state, None, Some(&vk), &request_id, &endpoint, started, StatusCode::FORBIDDEN, "model_not_allowed", &msg, 0, &body).await;
+    }
+
     // 3) Route aufloesen (hybrid: header-override gewinnt, sonst model-name)
     let provider_override = headers
         .get("x-llm-provider")
@@ -148,6 +212,23 @@ pub async fn proxy(
             return error_response(state, Some(&routing), Some(&vk), &request_id, &endpoint, started, failure.status, failure.error_type, &failure.message, 0, &body).await;
         }
     };
+
+    // Key-Scope: Retains auf die Target-Liste (Provider-Scope; Fallback-Namen
+    // nur explizit erlaubte). Leere Listen = unveraendert.
+    if let Some(error_type) = apply_target_scope(&mut targets, &vk.allowed_providers, &vk.allowed_models, &routing.effective_model) {
+        // bei aktivem Redirect das effektive (Ziel-)Modell nennen, nicht
+        // den irrefuehrenden Quellnamen
+        let model_for_msg = if routing.is_redirect {
+            routing.effective_model.clone()
+        } else {
+            requested_model.clone()
+        };
+        let msg = match error_type {
+            "provider_not_allowed" => format!("no provider allowed for this key serves model '{model_for_msg}'"),
+            _ => format!("model '{model_for_msg}' is not allowed for this key"),
+        };
+        return error_response(state, Some(&routing), Some(&vk), &request_id, &endpoint, started, StatusCode::FORBIDDEN, error_type, &msg, 0, &body).await;
+    }
 
     // Provider-Override: nur targets des gewuenschten providers behalten
     if let Some(override_name) = &provider_override {
@@ -1756,11 +1837,10 @@ pub async fn models_list(State(state): State<AppState>, headers: HeaderMap) -> R
             return (status, axum::Json(json!({"error": status_text(&status)}))).into_response();
         }
     };
-    let _ = vk;
-
+    // Key-Scope: gefilterte Modellliste (leere Listen = unveraendert)
     let routes = state.routes.read().await;
-    let models: Vec<Value> = routes
-        .iter()
+    let models: Vec<Value> = scoped_route_entries(&routes, &vk.allowed_providers, &vk.allowed_models)
+        .into_iter()
         .map(|(name, targets)| {
             // capabilities des ersten (primären) targets; namensgeber des modells
             let caps = targets.first().and_then(|t| t.capabilities.clone());
@@ -1782,6 +1862,40 @@ pub async fn models_list(State(state): State<AppState>, headers: HeaderMap) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_apply_target_scope_and_combination() {
+        let p1 = Uuid::new_v4();
+        let p2 = Uuid::new_v4();
+        let mut targets = vec![
+            scope_target(p1, "A"),
+            scope_target(p1, "B"),
+            scope_target(p2, "A"),
+        ];
+        // Nicht-leerer AND-Fall: Provider-Scope [p1] + Modell-Scope ["B"] ->
+        // genau (p1, "B") bleibt.
+        let err = apply_target_scope(&mut targets, &[p1], &["B".to_string()], "B");
+        assert!(err.is_none());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].provider_id, p1);
+        assert_eq!(targets[0].model_name, "B");
+    }
+
+    #[test]
+    fn test_scoped_route_entries_any_provider_semantics() {
+        let p1 = Uuid::new_v4();
+        let p2 = Uuid::new_v4();
+        let mut routes: std::collections::HashMap<String, Vec<RouteTarget>> =
+            std::collections::HashMap::new();
+        // "multi" hat Targets auf p1 UND p2, Provider-Scope nur [p1]:
+        // Name muss sichtbar bleiben (any()-Semantik, nicht all()).
+        routes.insert("multi".into(), vec![scope_target(p1, "m"), scope_target(p2, "m")]);
+        routes.insert("only-p2".into(), vec![scope_target(p2, "o")]);
+        let entries = scoped_route_entries(&routes, &[p1], &[]);
+        let names: Vec<&String> = entries.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&&"multi".to_string()));
+        assert!(!names.contains(&&"only-p2".to_string()));
+    }
 
     #[test]
     fn test_openai_stream_to_completion_json() {
@@ -2138,5 +2252,126 @@ mod tests {
         assert_eq!(f.status, StatusCode::NOT_FOUND);
         assert_eq!(f.error_type, "unknown_model");
         assert!(f.message.contains("A"), "{}", f.message);
+    }
+
+    // --- Key-Scopes (Allow-Listen pro Key) ---
+
+    fn scope_target(pid: Uuid, model: &str) -> RouteTarget {
+        RouteTarget {
+            provider_id: pid,
+            provider_name: "p".into(),
+            provider_kind: ProviderKind::OpenAi,
+            base_url: "http://localhost".into(),
+            api_key: "k".into(),
+            model_name: model.into(),
+            upstream_model: model.into(),
+            input_price_per_million: 0.0,
+            output_price_per_million: 0.0,
+            capabilities: None,
+        }
+    }
+
+    #[test]
+    fn test_model_scope_denied_on_requested_name() {
+        // leere Allow-List = unbeschränkt
+        assert!(!model_scope_denied(&[], "gpt-4o"));
+        // angefragter Name nicht erlaubten -> verweigert
+        assert!(model_scope_denied(&["gpt-4o".into()], "claude-3"));
+        // exakter Case-Match (keine Normalisierung)
+        assert!(model_scope_denied(&["gpt-4o".into()], "GPT-4O"));
+        // erlaubt -> durch
+        assert!(!model_scope_denied(&["gpt-4o".into()], "gpt-4o"));
+    }
+
+    #[test]
+    fn test_target_scope_provider_retain() {
+        let p1 = Uuid::new_v4();
+        let p2 = Uuid::new_v4();
+        let mut targets = vec![scope_target(p1, "A"), scope_target(p2, "A"), scope_target(p1, "A")];
+        // nur p1 erlaubt -> p2-Target gefiltert, Rest bleibt
+        let res = apply_target_scope(&mut targets, &[p1], &[], "A");
+        assert_eq!(res, None);
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().all(|t| t.provider_id == p1));
+    }
+
+    #[test]
+    fn test_target_scope_provider_empty_yields_403_type() {
+        let p1 = Uuid::new_v4();
+        let p2 = Uuid::new_v4();
+        let mut targets = vec![scope_target(p1, "A")];
+        // nur p2 erlaubt -> alle Targets weg, Provider-Scope gesetzt
+        let res = apply_target_scope(&mut targets, &[p2], &[], "A");
+        assert_eq!(res, Some("provider_not_allowed"));
+        assert!(targets.is_empty());
+
+        // Provider- UND Modell-Scope gesetzt: Provider gewinnt den Fehlertyp
+        let mut targets = vec![scope_target(p1, "A")];
+        let res = apply_target_scope(&mut targets, &[p2], &["A".into()], "A");
+        assert_eq!(res, Some("provider_not_allowed"));
+    }
+
+    #[test]
+    fn test_target_scope_fallback_model_removed() {
+        let p = Uuid::new_v4();
+        // Primär A (effektiv) + Fallback B; nur A explizit erlaubt
+        let mut targets = vec![scope_target(p, "A"), scope_target(p, "B")];
+        let res = apply_target_scope(&mut targets, &[], &["A".into()], "A");
+        assert_eq!(res, None);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].model_name, "A");
+
+        // Fallback explizit mit erlaubt -> beide bleiben
+        let mut targets = vec![scope_target(p, "A"), scope_target(p, "B")];
+        let res = apply_target_scope(&mut targets, &[], &["A".into(), "B".into()], "A");
+        assert_eq!(res, None);
+        assert_eq!(targets.len(), 2);
+
+        // effektives Modell (nach Redirect) bleibt erlaubt, auch wenn sein
+        // Name nicht in der Liste steht: Fallback B geht trotzdem raus
+        let mut targets = vec![scope_target(p, "A"), scope_target(p, "B")];
+        let res = apply_target_scope(&mut targets, &[], &["X".into()], "A");
+        assert_eq!(res, None);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].model_name, "A");
+
+        // nur Fallback übrig, das nicht erlaubt ist -> model_not_allowed
+        let mut targets = vec![scope_target(p, "B")];
+        let res = apply_target_scope(&mut targets, &[], &["A".into()], "A");
+        assert_eq!(res, Some("model_not_allowed"));
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_scoped_route_entries_models_list_filter() {
+        let p1 = Uuid::new_v4();
+        let p2 = Uuid::new_v4();
+        let mut routes: std::collections::HashMap<String, Vec<RouteTarget>> =
+            std::collections::HashMap::new();
+        routes.insert("A".to_string(), vec![scope_target(p1, "A")]);
+        routes.insert("B".to_string(), vec![scope_target(p2, "B")]);
+
+        // unbeschränkter Key -> unveränderte Liste
+        let all = scoped_route_entries(&routes, &[], &[]);
+        assert_eq!(all.len(), 2);
+
+        // nur Modell-Scope: nur A
+        let by_model = scoped_route_entries(&routes, &[], &["A".into()]);
+        assert_eq!(by_model.len(), 1);
+        assert_eq!(by_model[0].0, "A");
+
+        // nur Provider-Scope: nur B (p2)
+        let by_provider = scoped_route_entries(&routes, &[p2], &[]);
+        assert_eq!(by_provider.len(), 1);
+        assert_eq!(by_provider[0].0, "B");
+
+        // beide: Schnittmenge -> A (erlaubtes Modell) ABER p1 nicht erlaubt
+        let none = scoped_route_entries(&routes, &[p2], &["A".into()]);
+        assert!(none.is_empty());
+
+        // Modell erlaubt, das A mit p1 bedient, p1 erlaubt -> A sichtbar
+        let hit = scoped_route_entries(&routes, &[p1], &["A".into()]);
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].0, "A");
     }
 }

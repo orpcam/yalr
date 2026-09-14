@@ -124,6 +124,178 @@ struct KeyRow {
     key_hint: Option<String>,
 }
 
+#[derive(sqlx::FromRow)]
+struct KeyProviderScopeRow {
+    virtual_key_id: Uuid,
+    provider_id: Uuid,
+    name: String,
+    kind: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct KeyModelScopeRow {
+    virtual_key_id: Uuid,
+    model_name: String,
+}
+
+/// Bereinigt Modellnamen-Listen: trimmen, Leere und Duplikate entfernen.
+/// Exakter Case-Match (keine Normalisierung) — konsistent mit
+/// resolve_route, das ebenfalls exakt matched.
+fn clean_model_names(raw: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for n in raw {
+        let n = n.trim().to_string();
+        if n.is_empty() || out.iter().any(|e| e == &n) {
+            continue;
+        }
+        out.push(n);
+    }
+    out
+}
+
+/// Dedupliziert Provider-ID-Listen unter Wahrung der Reihenfolge des
+/// ersten Vorkommens (Pendant zu clean_model_names ohne Trim/Leerfilter —
+/// UUIDs sind strukturiert, leerer Vec bleibt leerer Vec).
+fn clean_provider_ids(raw: Vec<Uuid>) -> Vec<Uuid> {
+    let mut out: Vec<Uuid> = Vec::new();
+    for id in raw {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// Valldiert Scope-Eintraege gegen die DB (fuer create_key/update_key).
+/// Ok = Listen sind gueltig, Err = 400-Response mit den unbekannten Werten.
+async fn validate_key_scopes(
+    state: &AppState,
+    provider_ids: &[Uuid],
+    model_names: &[String],
+) -> Result<(), Response> {
+    if !provider_ids.is_empty() {
+        let found: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM providers WHERE id = ANY($1)",
+        )
+        .bind(provider_ids.to_vec())
+        .fetch_all(&state.pg)
+        .await
+        .map_err(|e| server_error(e))?;
+        let missing: Vec<String> = provider_ids
+            .iter()
+            .filter(|id| !found.contains(id))
+            .map(|id| id.to_string())
+            .collect();
+        if !missing.is_empty() {
+            return Err(bad_request(&format!(
+                "unknown provider ids: {}",
+                missing.join(", ")
+            )));
+        }
+    }
+    if !model_names.is_empty() {
+        let found: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT model_name FROM models WHERE model_name = ANY($1)",
+        )
+        .bind(model_names.to_vec())
+        .fetch_all(&state.pg)
+        .await
+        .map_err(|e| server_error(e))?;
+        let missing: Vec<&str> = model_names
+            .iter()
+            .filter(|n| !found.contains(n))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            return Err(bad_request(&format!(
+                "unknown model names: {}",
+                missing.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Laedt die Scopes aller uebergbenen Keys in zwei Batch-Queries (kein N+1)
+/// und gruppiert sie in Rust. DB-Fehler werden propagated (kein silent
+/// Fail-open in der Admin-Liste).
+async fn load_key_scopes(
+    pg: &sqlx::PgPool,
+    key_ids: &[Uuid],
+) -> Result<(HashMap<Uuid, Vec<Value>>, HashMap<Uuid, Vec<String>>), sqlx::Error> {
+    let mut providers: HashMap<Uuid, Vec<Value>> = HashMap::new();
+    let mut models: HashMap<Uuid, Vec<String>> = HashMap::new();
+    if key_ids.is_empty() {
+        return Ok((providers, models));
+    }
+    let rows = sqlx::query_as::<_, KeyProviderScopeRow>(
+        "SELECT kp.virtual_key_id, kp.provider_id, p.name, p.kind
+         FROM key_providers kp
+         JOIN providers p ON p.id = kp.provider_id
+         WHERE kp.virtual_key_id = ANY($1)",
+    )
+    .bind(key_ids.to_vec())
+    .fetch_all(pg)
+    .await?;
+    for r in rows {
+        providers.entry(r.virtual_key_id).or_default().push(json!({
+            "id": r.provider_id,
+            "name": r.name,
+            "kind": r.kind,
+        }));
+    }
+    let rows = sqlx::query_as::<_, KeyModelScopeRow>(
+        "SELECT virtual_key_id, model_name FROM key_models WHERE virtual_key_id = ANY($1)",
+    )
+    .bind(key_ids.to_vec())
+    .fetch_all(pg)
+    .await?;
+    for r in rows {
+        models.entry(r.virtual_key_id).or_default().push(r.model_name);
+    }
+    Ok((providers, models))
+}
+
+/// Mapped Scope-Insert-Fehler: FK-Verletzung (23503, Provider/Modell wurde
+/// zwischen Validierung und Insert geloescht) -> 400, alles andere -> 500.
+fn scope_insert_error(e: sqlx::Error) -> Response {
+    match &e {
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("23503") => bad_request(
+            "provider or model was deleted concurrently, please reload and retry",
+        ),
+        _ => server_error(e),
+    }
+}
+
+/// 409 fuer delete_provider, wenn Key-Scopes den Provider referenzieren
+/// (FK RESTRICT auf key_providers).
+fn key_scope_conflict(key_names: &[String]) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "conflict",
+            "detail": format!(
+                "provider is referenced by key scopes of: {}",
+                key_names.join(", ")
+            ),
+        })),
+    )
+        .into_response()
+}
+
+/// Namen der Keys, deren Provider-Scope den Provider referenziert.
+async fn keys_scoped_to_provider(pg: &sqlx::PgPool, provider_id: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT vk.name FROM key_providers kp
+         JOIN virtual_keys vk ON vk.id = kp.virtual_key_id
+         WHERE kp.provider_id = $1",
+    )
+    .bind(provider_id)
+    .fetch_all(pg)
+    .await
+    .unwrap_or_default()
+}
+
 pub async fn list_keys(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if auth::require_session(&state, &headers).await.is_err() {
         return unauthorized();
@@ -140,6 +312,11 @@ pub async fn list_keys(State(state): State<AppState>, headers: HeaderMap) -> Res
 
     match rows {
         Ok(rows) => {
+            let key_ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+            let (scopes_providers, scopes_models) = match load_key_scopes(&state.pg, &key_ids).await {
+                Ok(s) => s,
+                Err(e) => return server_error(e),
+            };
             let keys: Vec<_> = rows
                 .into_iter()
                 .map(|r| {
@@ -152,6 +329,9 @@ pub async fn list_keys(State(state): State<AppState>, headers: HeaderMap) -> Res
                         "created_at": r.created_at,
                         "last_used_at": r.last_used_at,
                         "key_hint": r.key_hint.unwrap_or_default(),
+                        // leere Arrays = unbeschränkt
+                        "allowed_providers": scopes_providers.get(&r.id).cloned().unwrap_or_default(),
+                        "allowed_models": scopes_models.get(&r.id).cloned().unwrap_or_default(),
                     })
                 })
                 .collect();
@@ -165,6 +345,8 @@ pub async fn list_keys(State(state): State<AppState>, headers: HeaderMap) -> Res
 pub struct CreateKeyRequest {
     pub name: String,
     pub budget_cents: Option<i64>,
+    pub allowed_provider_ids: Option<Vec<Uuid>>,
+    pub allowed_model_names: Option<Vec<String>>,
 }
 
 pub async fn create_key(
@@ -179,6 +361,13 @@ pub async fn create_key(
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "name required"}))).into_response();
     }
 
+    // Scope-Listen bereinigen und validieren (fehlende Provider/Modelle -> 400)
+    let provider_ids = clean_provider_ids(req.allowed_provider_ids.clone().unwrap_or_default());
+    let model_names = clean_model_names(req.allowed_model_names.clone().unwrap_or_default());
+    if let Err(resp) = validate_key_scopes(&state, &provider_ids, &model_names).await {
+        return resp;
+    }
+
     // key generieren
     let mut raw = [0u8; 24];
     use rand::RngCore;
@@ -190,25 +379,66 @@ pub async fn create_key(
     // klartext verschluesselt persistieren (v2 AEAD mit APP_SECRET) fuer reveal
     let key_encrypted = common::crypto::encrypt(&key, &state.encryption_key);
 
+    // Key-Insert + Scope-Inserts in einer Transaktion (kein Zwischenstand,
+    // in dem der Key ohne/teilweise Scope existiert).
+    let key_id = Uuid::new_v4();
+    let mut tx = match state.pg.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return server_error(e),
+    };
     let res = sqlx::query(
         r#"
         INSERT INTO virtual_keys (id, name, key_hash, key_prefix, budget_cents, key_hint, key_encrypted)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         "#,
     )
-    .bind(Uuid::new_v4())
+    .bind(key_id)
     .bind(req.name.trim())
     .bind(&key_hash)
     .bind(&key_prefix)
     .bind(req.budget_cents)
     .bind(&key_hint)
     .bind(&key_encrypted)
-    .execute(&state.pg)
+    .execute(&mut *tx)
     .await;
 
     match res {
-        Ok(_) => Json(json!({ "key": key, "name": req.name.trim() })).into_response(),
-        Err(e) => server_error(e),
+        Ok(_) => {
+            for pid in &provider_ids {
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO key_providers (virtual_key_id, provider_id) VALUES ($1, $2)",
+                )
+                .bind(key_id)
+                .bind(pid)
+                .execute(&mut *tx)
+                .await
+                {
+                    let _ = tx.rollback().await;
+                    return scope_insert_error(e);
+                }
+            }
+            for name in &model_names {
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO key_models (virtual_key_id, model_name) VALUES ($1, $2)",
+                )
+                .bind(key_id)
+                .bind(name)
+                .execute(&mut *tx)
+                .await
+                {
+                    let _ = tx.rollback().await;
+                    return scope_insert_error(e);
+                }
+            }
+            if let Err(e) = tx.commit().await {
+                return server_error(e);
+            }
+            Json(json!({ "key": key, "name": req.name.trim() })).into_response()
+        }
+        Err(e) => {
+            let _ = tx.rollback().await;
+            server_error(e)
+        }
     }
 }
 
@@ -217,6 +447,11 @@ pub struct UpdateKeyRequest {
     pub name: Option<String>,
     pub budget_cents: Option<Option<i64>>,
     pub enabled: Option<bool>,
+    /// JSON-Semantik: Feld fehlt/null = unveraendert (wichtig: der
+    /// Enable-Toggle schickt nur {enabled}), Array = setzen, [] = leeren
+    /// (= unbeschränkt).
+    pub allowed_provider_ids: Option<Option<Vec<Uuid>>>,
+    pub allowed_model_names: Option<Option<Vec<String>>>,
 }
 
 pub async fn update_key(
@@ -248,6 +483,33 @@ pub async fn update_key(
         None => existing.budget_cents,
     };
 
+    // Scope-Änderungen: Some(Some(..)) = setzen ([] = leeren),
+    // None bzw. Some(None) = unveraendert.
+    let new_providers: Option<Vec<Uuid>> = req.allowed_provider_ids.flatten().map(clean_provider_ids);
+    let new_models: Option<Vec<String>> = req
+        .allowed_model_names
+        .flatten()
+        .map(clean_model_names);
+    // Jede Dimension unabhaengig validieren: auch wenn der Client nur das
+    // Modell-Feld (ohne Provider-Feld) schickt, muss es gegen die DB
+    // gecheckt werden ([] = leeren laeuft problemlos durch).
+    if let Some(p) = &new_providers {
+        if let Err(resp) = validate_key_scopes(&state, p, &[]).await {
+            return resp;
+        }
+    }
+    if let Some(m) = &new_models {
+        if let Err(resp) = validate_key_scopes(&state, &[], m).await {
+            return resp;
+        }
+    }
+
+    // Key-Update + Scope-Replace (DELETE + INSERTs) in EINER Transaktion:
+    // kein Zwischenzustand ohne Scope (= fail-open).
+    let mut tx = match state.pg.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return server_error(e),
+    };
     let res = sqlx::query(
         "UPDATE virtual_keys SET name = $1, budget_cents = $2, enabled = $3 WHERE id = $4",
     )
@@ -255,16 +517,68 @@ pub async fn update_key(
     .bind(budget)
     .bind(enabled)
     .bind(id)
-    .execute(&state.pg)
+    .execute(&mut *tx)
     .await;
 
     match res {
         Ok(_) => {
+            if let Some(ids) = &new_providers {
+                if let Err(e) = sqlx::query("DELETE FROM key_providers WHERE virtual_key_id = $1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                {
+                    let _ = tx.rollback().await;
+                    return server_error(e);
+                }
+                for pid in ids {
+                    if let Err(e) = sqlx::query(
+                        "INSERT INTO key_providers (virtual_key_id, provider_id) VALUES ($1, $2)",
+                    )
+                    .bind(id)
+                    .bind(pid)
+                    .execute(&mut *tx)
+                    .await
+                    {
+                        let _ = tx.rollback().await;
+                        return scope_insert_error(e);
+                    }
+                }
+            }
+            if let Some(names) = &new_models {
+                if let Err(e) = sqlx::query("DELETE FROM key_models WHERE virtual_key_id = $1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                {
+                    let _ = tx.rollback().await;
+                    return server_error(e);
+                }
+                for name in names {
+                    if let Err(e) = sqlx::query(
+                        "INSERT INTO key_models (virtual_key_id, model_name) VALUES ($1, $2)",
+                    )
+                    .bind(id)
+                    .bind(name)
+                    .execute(&mut *tx)
+                    .await
+                    {
+                        let _ = tx.rollback().await;
+                        return scope_insert_error(e);
+                    }
+                }
+            }
+            if let Err(e) = tx.commit().await {
+                return server_error(e);
+            }
             // key-cache invalidieren (einfach: ganz leeren)
             state.key_cache.write().await.clear();
             Json(json!({"ok": true})).into_response()
         }
-        Err(e) => server_error(e),
+        Err(e) => {
+            let _ = tx.rollback().await;
+            server_error(e)
+        }
     }
 }
 
@@ -506,6 +820,15 @@ pub async fn delete_provider(
     if auth::require_session(&state, &headers).await.is_err() {
         return unauthorized();
     }
+
+    // Key-Scopes: FK RESTRICT auf key_providers bockt den Loeschen, wenn
+    // Keys den Provider erlauben. Vorpher-Check mit Key-Namen -> 409,
+    // damit der Admin weiss, welche Keys entscopt werden muessen.
+    let scoped_keys = keys_scoped_to_provider(&state.pg, id).await;
+    if !scoped_keys.is_empty() {
+        return key_scope_conflict(&scoped_keys);
+    }
+
     let res = sqlx::query("DELETE FROM providers WHERE id = $1")
         .bind(id)
         .execute(&state.pg)
@@ -513,9 +836,22 @@ pub async fn delete_provider(
     match res {
         Ok(_) => {
             let _ = state.reload_routes().await;
+            // Scopes koennen sich geaendert haben: key-cache mit leeren
+            state.key_cache.write().await.clear();
             Json(json!({"ok": true})).into_response()
         }
-        Err(e) => server_error(e),
+        Err(e) => {
+            // Race: Scope wurde parallel angelegt (FK-RESTRICT, 23503).
+            // Nur key_providers-bedingt -> 409 mit Key-Namen; andere 23503
+            // (z.B. models-FK) bleiben DB-Fehler wie bisher.
+            if matches!(&e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23503")) {
+                let names = keys_scoped_to_provider(&state.pg, id).await;
+                if !names.is_empty() {
+                    return key_scope_conflict(&names);
+                }
+            }
+            server_error(e)
+        }
     }
 }
 
@@ -1416,6 +1752,16 @@ pub async fn delete_model(
     if auth::require_session(&state, &headers).await.is_err() {
         return unauthorized();
     }
+    // Modellname vorher merken (Best-Effort-Warnung fuer key_models-Scopes)
+    let model_name: Option<String> = sqlx::query_scalar(
+        "SELECT model_name FROM models WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pg)
+    .await
+    .ok()
+    .flatten();
+
     let res = sqlx::query("DELETE FROM models WHERE id = $1")
         .bind(id)
         .execute(&state.pg)
@@ -1423,7 +1769,27 @@ pub async fn delete_model(
     match res {
         Ok(_) => {
             let _ = state.reload_routes().await;
-            Json(json!({"ok": true})).into_response()
+            // Best-Effort-Info (kein 409): der Name kann weiterhin in
+            // key_models-Scopes stecken; der Proxy antwortet dann fail-closed
+            // mit 403, also harmlos. Hinweis fuer den Admin trotzdem mitschicken.
+            let warning = if let Some(name) = &model_name {
+                let refs: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM key_models WHERE model_name = $1",
+                )
+                .bind(name)
+                .fetch_one(&state.pg)
+                .await
+                .unwrap_or(0);
+                (refs > 0)
+                    .then(|| format!("model '{name}' is still referenced by {refs} key scope(s)"))
+            } else {
+                None
+            };
+            let mut obj = json!({ "ok": true });
+            if let Some(w) = warning {
+                obj["warning"] = json!(w);
+            }
+            Json(obj).into_response()
         }
         Err(e) => server_error(e),
     }
@@ -5201,7 +5567,7 @@ mod redirect_tests {
         std::env::var("DASHBOARD_TEST_DATABASE_URL").ok().filter(|s| !s.is_empty())
     }
 
-    async fn test_state() -> Option<AppState> {
+    pub(crate) async fn test_state() -> Option<AppState> {
         let url = test_db_url()?;
         let pg = sqlx::PgPool::connect(&url).await.ok()?;
         sqlx::migrate!("../../migrations").run(&pg).await.ok()?;
@@ -5221,7 +5587,7 @@ mod redirect_tests {
         )))
     }
 
-    async fn seed_session(pg: &sqlx::PgPool) -> Option<String> {
+    pub(crate) async fn seed_session(pg: &sqlx::PgPool) -> Option<String> {
         let username = format!("redirect-test-{}", Uuid::new_v4().simple());
         crate::auth::ensure_admin_user(pg, &username, "test-password-123")
             .await
@@ -5229,7 +5595,7 @@ mod redirect_tests {
         crate::auth::create_session(pg, &username).await.ok()
     }
 
-    fn auth_headers(token: &str) -> HeaderMap {
+    pub(crate) fn auth_headers(token: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(
             "cookie",
@@ -5240,7 +5606,7 @@ mod redirect_tests {
         h
     }
 
-    async fn body_json(res: Response) -> Value {
+    pub(crate) async fn body_json(res: Response) -> Value {
         let (_parts, body) = res.into_parts();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
@@ -5452,6 +5818,237 @@ mod redirect_tests {
             .bind(&a)
             .execute(&pg)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod key_scope_tests {
+    // Key-Scopes (Allow-Listen pro Key): create/list/update/delete-provider-
+    // 409/delete-model-Warnung. Wie redirect_tests nur mit
+    // DASHBOARD_TEST_DATABASE_URL, sonst No-Op.
+    use super::redirect_tests::{auth_headers, body_json, seed_session, test_state};
+    use super::*;
+
+    async fn create_key_call(state: &AppState, headers: &HeaderMap, req: &Value) -> Response {
+        // Ueber JSON parsen: ueberprueft auch die Feldnamen des API-Vertrags
+        let parsed: CreateKeyRequest = serde_json::from_value(req.clone()).unwrap();
+        create_key(State(state.clone()), headers.clone(), Json(parsed)).await
+    }
+
+    fn find_key<'a>(v: &'a Value, name: &str) -> &'a Value {
+        v["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == json!(name))
+            .expect("key in liste")
+    }
+
+    #[tokio::test]
+    async fn test_key_scope_crud_and_provider_conflict() {
+        let Some(state) = test_state().await else { return };
+        let pg = state.pg.clone();
+        let Some(token) = seed_session(&pg).await else { return };
+        let headers = auth_headers(&token);
+        let suffix = Uuid::new_v4().simple().to_string();
+
+        // 2 provider; Modelle nur auf p1
+        let p1 = Uuid::new_v4();
+        let p2 = Uuid::new_v4();
+        for (pid, tag) in [(p1, "p1"), (p2, "p2")] {
+            sqlx::query(
+                "INSERT INTO providers (id, name, kind, base_url, api_key_encrypted, enabled) VALUES ($1, $2, 'openai', 'http://localhost', 'x', true)",
+            )
+            .bind(pid)
+            .bind(format!("ksc-{tag}-{suffix}"))
+            .execute(&pg)
+            .await
+            .unwrap();
+        }
+        let m1 = format!("ksc-m1-{suffix}");
+        let m2 = format!("ksc-m2-{suffix}");
+        for m in [&m1, &m2] {
+            sqlx::query(
+                "INSERT INTO models (id, provider_id, model_name, upstream_model) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(p1)
+            .bind(m)
+            .bind(m)
+            .execute(&pg)
+            .await
+            .unwrap();
+        }
+
+        // create: Scopes werden gespeichert (Duplikate/Weisse bereinigt)
+        let key_name = format!("ksc-key-{suffix}");
+        let res = create_key_call(&state, &headers, &json!({
+            "name": key_name,
+            "allowed_provider_ids": [p1, p1, p2],
+            "allowed_model_names": [m1, m1, "  ", m2],
+        }))
+        .await;
+        assert_eq!(res.status(), StatusCode::OK, "{}", body_json(res).await);
+
+        let v = body_json(list_keys(State(state.clone()), headers.clone()).await).await;
+        let entry = find_key(&v, &key_name);
+        let key_id: Uuid = serde_json::from_value(entry["id"].clone()).unwrap();
+        let ap: Vec<Value> =
+            entry["allowed_providers"].as_array().unwrap().iter().map(|p| p["id"].clone()).collect();
+        assert_eq!(ap.len(), 2);
+        assert!(ap.contains(&json!(p1)) && ap.contains(&json!(p2)));
+        assert!(entry["allowed_providers"].as_array().unwrap()[0]["name"].is_string());
+        assert!(entry["allowed_providers"].as_array().unwrap()[0]["kind"] == json!("openai"));
+        let am: Vec<String> = entry["allowed_models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m.as_str().map(String::from))
+            .collect();
+        assert_eq!(am, vec![m1.clone(), m2.clone()]);
+
+        // create: unbekannter Provider bzw. Modell -> 400
+        let res = create_key_call(
+            &state,
+            &headers,
+            &json!({"name": format!("ksc-bad-{suffix}"), "allowed_provider_ids": [Uuid::new_v4()]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let res = create_key_call(
+            &state,
+            &headers,
+            &json!({"name": format!("ksc-bad2-{suffix}"), "allowed_model_names": ["ksc-unknown"]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // update: nur {enabled} -> Scopes bleiben unangetastet (Toggle-Semantik)
+        let res = update_key(
+            State(state.clone()),
+            headers.clone(),
+            Path(key_id),
+            Json(UpdateKeyRequest {
+                name: None,
+                budget_cents: None,
+                enabled: Some(true),
+                allowed_provider_ids: None,
+                allowed_model_names: None,
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        // update: explizites null -> ebenfalls unveraendert
+        let res = update_key(
+            State(state.clone()),
+            headers.clone(),
+            Path(key_id),
+            Json(UpdateKeyRequest {
+                name: None,
+                budget_cents: None,
+                enabled: None,
+                allowed_provider_ids: None,
+                allowed_model_names: Some(None),
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(list_keys(State(state.clone()), headers.clone()).await).await;
+        let entry = find_key(&v, &key_name);
+        assert_eq!(entry["allowed_models"].as_array().unwrap().len(), 2);
+        assert_eq!(entry["allowed_providers"].as_array().unwrap().len(), 2);
+
+        // delete_model, das in key_models referenziert ist -> 200 + warning
+        // (vor dem Provider-Delete: der cascaded die Modelle mit)
+        let res = create_key_call(
+            &state,
+            &headers,
+            &json!({"name": format!("ksc-key2-{suffix}"), "allowed_model_names": [m2]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let m2_id: Uuid = sqlx::query_scalar("SELECT id FROM models WHERE model_name = $1")
+            .bind(&m2)
+            .fetch_one(&pg)
+            .await
+            .unwrap();
+        let res = delete_model(State(state.clone()), headers.clone(), Path(m2_id)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert!(v["warning"].as_str().unwrap().contains(&m2), "{}", v);
+        assert!(v["warning"].as_str().unwrap().contains("key scope"), "{}", v);
+
+        // delete_provider mit referenzierendem Key -> 409 mit Key-Namen
+        let res = delete_provider(State(state.clone()), headers.clone(), Path(p1)).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let v = body_json(res).await;
+        assert!(v["detail"].as_str().unwrap().contains(&key_name), "{}", v);
+
+        // update: [] leert den Provider-Scope -> Delete moeglich
+        let res = update_key(
+            State(state.clone()),
+            headers.clone(),
+            Path(key_id),
+            Json(UpdateKeyRequest {
+                name: None,
+                budget_cents: None,
+                enabled: None,
+                allowed_provider_ids: Some(Some(vec![])),
+                allowed_model_names: None,
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(list_keys(State(state.clone()), headers.clone()).await).await;
+        assert!(find_key(&v, &key_name)["allowed_providers"].as_array().unwrap().is_empty());
+        let res = delete_provider(State(state.clone()), headers.clone(), Path(p1)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // cleanup (Key-Delete cascaded Scopes)
+        for key in [&key_name, &format!("ksc-key2-{suffix}")] {
+            let kid: Uuid = sqlx::query_scalar("SELECT id FROM virtual_keys WHERE name = $1")
+                .bind(key)
+                .fetch_one(&pg)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM virtual_keys WHERE id = $1")
+                .bind(kid)
+                .execute(&pg)
+                .await
+                .unwrap();
+        }
+        let _ = sqlx::query("DELETE FROM providers WHERE id = $1")
+            .bind(p2)
+            .execute(&pg)
+            .await;
+    }
+}
+
+#[cfg(test)]
+mod scope_clean_tests {
+    use super::*;
+
+    #[test]
+    fn test_clean_model_names_trims_dedups_and_drops_empty() {
+        assert_eq!(
+            clean_model_names(vec![" a ".into(), "a".into(), "  ".into(), "".into(), "b".into()]),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(clean_model_names(vec![]), Vec::<String>::new());
+        // exakter Case-Match: Duplikate nur bei identischem Case
+        assert_eq!(
+            clean_model_names(vec!["A".into(), "a".into()]),
+            vec!["A".to_string(), "a".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_clean_provider_ids_dedups_and_keeps_first_order() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        assert_eq!(clean_provider_ids(vec![a, a, b, b, a]), vec![a, b]);
+        assert_eq!(clean_provider_ids(vec![b, a]), vec![b, a]);
+        assert_eq!(clean_provider_ids(vec![]), Vec::<Uuid>::new());
     }
 }
 

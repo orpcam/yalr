@@ -43,6 +43,10 @@ pub struct VirtualKey {
     pub key_hash: String,
     pub budget_cents: Option<i64>,
     pub enabled: bool,
+    /// Allow-List provider_id; leer = unbeschränkt.
+    pub allowed_providers: Vec<Uuid>,
+    /// Allow-List angefragter Modellnamen (Client-Sicht); leer = unbeschränkt.
+    pub allowed_models: Vec<String>,
 }
 
 /// Ausgaben eines Keys (aus ClickHouse agregiert, periodisch aktualisiert).
@@ -299,12 +303,44 @@ impl AppStateInner {
             return None;
         }
 
+        // Key-Scopes (leer = unbeschränkt in der jeweiligen Dimension).
+        // Fehlerbehandlung fail-closed wie das Haupt-Query: DB-Fehler -> Key
+        // nicht verwenden (401), statt still unbeschränkt zu werden.
+        let allowed_providers: Vec<Uuid> = match sqlx::query_scalar(
+            "SELECT provider_id FROM key_providers WHERE virtual_key_id = $1",
+        )
+        .bind(row.id)
+        .fetch_all(&self.pg)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(key_id = %row.id, error = %e, "failed to load key provider scope; denying key");
+                return None;
+            }
+        };
+        let allowed_models: Vec<String> = match sqlx::query_scalar(
+            "SELECT model_name FROM key_models WHERE virtual_key_id = $1",
+        )
+        .bind(row.id)
+        .fetch_all(&self.pg)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(key_id = %row.id, error = %e, "failed to load key model scope; denying key");
+                return None;
+            }
+        };
+
         let vk = VirtualKey {
             id: row.id,
             name: row.name,
             key_hash: row.key_hash,
             budget_cents: row.budget_cents,
             enabled: row.enabled,
+            allowed_providers,
+            allowed_models,
         };
 
         let mut cache = self.key_cache.write().await;
