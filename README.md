@@ -1,6 +1,6 @@
 # YALR — Yet Another LLM Router
 
-YALR is a self-hosted LLM gateway (similar to Helicone/LiteLLM) written in Rust: a unified OpenAI-compatible API for multiple providers, with request logging, cost tracking, virtual keys, fallbacks, and an embedded web dashboard.
+YALR is a self-hosted LLM gateway (similar to Helicone/LiteLLM) written in Rust: a unified OpenAI-compatible API for multiple providers, with request logging, cost tracking, virtual keys, fallbacks, temporary redirects, and an embedded web dashboard.
 
 ## Features
 
@@ -15,11 +15,18 @@ YALR is a self-hosted LLM gateway (similar to Helicone/LiteLLM) written in Rust:
   requests can be filtered by key name in the dashboard
 - **Fallbacks & Retries**: per-model fallback chains, automatic retries on
   transient errors (429/5xx/network)
+- **Temporary Redirects**: deliberate model reroutes (A → B) that always
+  apply, even while A is healthy — single-hop, at most one per model, with
+  an optional note. Unlike fallbacks, a redirect takes precedence over the
+  model's own route; the target's fallback chains still apply
 - **Logging & Costs**: every request is logged asynchronously (without blocking
   the hot path) to ClickHouse, including token usage and costs; 90-day TTL
 - **Dashboard**: React UI with overview (KPIs, charts), request log with
-  request/response details, key management, provider/model/fallback setup
+  request/response details, key management, provider/model/fallback/redirect
+  setup
   - Dark/light mode, English/German UI (switchable in settings)
+- **Routing Visibility**: served-by-fallback and served-by-redirect markers
+  on overview, live requests, and the request log (including in-flight rows)
 
 ## Architecture
 
@@ -30,7 +37,7 @@ Public ──► Caddy Edge :8081 (only /v1/*, /health, /metrics)
 Client ──► Gateway :8080 ──► OpenAI / Anthropic / Gemini / OpenAI-compatible
               │  Auth (virtual keys, sha256 + cache)
               │  Retry/Fallback (provider chain)
-              ├─► Postgres   (keys, provider credentials, models, fallbacks, sessions)
+              ├─► Postgres   (keys, provider credentials, models, fallbacks, redirects, sessions)
               ├─► ClickHouse (request logs, batched via channel)
               └─► /dashboard-api + React UI (session cookie, bcrypt) — private
 ```
@@ -44,7 +51,8 @@ docker compose up --build
 
 - Dashboard: http://localhost:8080/ (log in with `ADMIN_USERNAME`/`ADMIN_PASSWORD` from `.env`)
 - Initial setup in the dashboard under "Providers & Models": add provider
-  credentials, map models (with prices), optionally define fallbacks
+  credentials, map models (with prices), optionally define fallback chains
+  or temporary redirects
 - Create a named key under "API Keys"
 
 ## Usage (Gateway)
@@ -98,7 +106,7 @@ crates/
 ├── common/     # AppState (pools, key cache, routing table), crypto, auth
 ├── providers/  # Provider adapters + format translation (OpenAI/Anthropic/Gemini)
 ├── ingest/     # Async log pipeline: channel → ClickHouse batch inserts
-├── yalr/       # Axum server: proxy, retry/fallback, SSE streaming
+├── yalr/       # Axum server: proxy, retry/fallback, redirects, SSE streaming
 └── dashboard/  # Dashboard API + embedded React UI
 dashboard-ui/   # React (Vite + Tailwind, shadcn-style)
 migrations/     # Postgres migrations
