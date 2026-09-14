@@ -68,6 +68,9 @@ pub struct AppStateInner {
     pub key_spend: RwLock<HashMap<Uuid, KeySpend>>,
     /// Fallback-Definitionen: model_name -> [fallback model names]
     pub fallbacks: RwLock<HashMap<String, Vec<String>>>,
+    /// Temporäre, absichtsvolle Redirects: model_name -> redirect_model_name.
+    /// Greifen immer (unabhängig von Ziels Gesundheit), max. EIN Hop.
+    pub redirects: RwLock<HashMap<String, String>>,
     /// Cache fuer CH-Latenz-Quantile (Prometheus-Snapshot).
     pub metrics_snapshot: Arc<RwLock<MetricsSnapshot>>,
     /// Optionaler Token fuer GET /metrics (None = Endpoint offen).
@@ -75,6 +78,15 @@ pub struct AppStateInner {
 }
 
 pub type AppState = Arc<AppStateInner>;
+
+/// Ergebnis von `resolve_route`: der effektive Modellname (nach max. EINEM
+/// Redirect-Hop) und die aufgelösten Ziel-Targets (primär + Fallbacks des
+/// ZIELS). `targets` ist `None`, wenn für den effektiven Namen keine Route
+/// existiert (u.a. der "tote Redirect"-Fall).
+pub struct ResolvedRoute {
+    pub effective: String,
+    pub targets: Option<Vec<RouteTarget>>,
+}
 
 impl AppStateInner {
     pub fn new(
@@ -98,6 +110,7 @@ impl AppStateInner {
             routes: RwLock::new(HashMap::new()),
             key_spend: RwLock::new(HashMap::new()),
             fallbacks: RwLock::new(HashMap::new()),
+            redirects: RwLock::new(HashMap::new()),
             metrics_snapshot,
             metrics_token,
         }
@@ -179,35 +192,71 @@ impl AppStateInner {
             fallbacks.entry(row.model_name).or_default().push(row.fallback_model_name);
         }
 
+        // Redirects laden (model_name -> redirect_model_name)
+        #[derive(sqlx::FromRow)]
+        struct RedirectRow {
+            model_name: String,
+            redirect_model_name: String,
+        }
+        let redirect_rows = sqlx::query_as::<_, RedirectRow>(
+            r#"
+            SELECT model_name, redirect_model_name
+            FROM redirects
+            "#,
+        )
+        .fetch_all(&self.pg)
+        .await?;
+
+        let mut redirects: HashMap<String, String> = HashMap::new();
+        for row in redirect_rows {
+            redirects.insert(row.model_name, row.redirect_model_name);
+        }
+
+        // Lock-Beschaffungs-Reihenfolge konsistent halten:
+        // redirects -> routes -> fallbacks.
+        let mut redirect_guard = self.redirects.write().await;
+        *redirect_guard = redirects;
         let mut routes_guard = self.routes.write().await;
         *routes_guard = routes;
         let mut fb_guard = self.fallbacks.write().await;
         *fb_guard = fallbacks;
-        tracing::info!("routes loaded: {} models", routes_guard.len());
+        tracing::info!("routes loaded: {} models, {} redirects", routes_guard.len(), redirect_guard.len());
         Ok(())
     }
 
-    /// Liefert die Route-Ziele fuer einen Model-Namen (primär + fallbacks aufgeloest).
-    pub async fn resolve_route(&self, model_name: &str) -> Option<Vec<RouteTarget>> {
+    /// Loest einen angefragten Model-Namen in effektiven Namen + Targets auf.
+    ///
+    /// 1. Redirect: `effective = redirects[requested]` — genau EIN Hop, Redirects
+    ///    werden NICHT verkettet (wird das Ziel selbst redirectet, folgt das
+    ///    hier nicht weiter).
+    /// 2. Targets: primär `routes[effective]` + für jeden Namen in
+    ///    `fallbacks[effective]` deren `routes` (Bestehende Fallback-Logik,
+    ///    aber auf `effective` statt `requested` angewandt).
+    pub async fn resolve_route(&self, model_name: &str) -> ResolvedRoute {
+        let redirects = self.redirects.read().await;
         let routes = self.routes.read().await;
         let fallbacks = self.fallbacks.read().await;
 
-        let mut result = Vec::new();
-        if let Some(primary) = routes.get(model_name) {
+        // max. EIN Hop: Redirect auf das Ziel des Redirects wird nicht gefolgt.
+        let effective = redirects
+            .get(model_name)
+            .cloned()
+            .unwrap_or_else(|| model_name.to_string());
+
+        let mut result: Vec<RouteTarget> = Vec::new();
+        if let Some(primary) = routes.get(&effective) {
             result.extend(primary.iter().cloned());
         }
-        if let Some(fb_names) = fallbacks.get(model_name) {
+        if let Some(fb_names) = fallbacks.get(&effective) {
             for fb_name in fb_names {
                 if let Some(targets) = routes.get(fb_name) {
                     result.extend(targets.iter().cloned());
                 }
             }
         }
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
+
+        let targets = if result.is_empty() { None } else { Some(result) };
+        ResolvedRoute { effective, targets }
     }
 
     /// VirtualKey anhand des Key-Hashes ermitteln (mit Cache).
@@ -311,5 +360,151 @@ impl AppStateInner {
             entry.cost_usd += cost_delta;
             entry.updated_at = Some(Instant::now());
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_target(model: &str) -> RouteTarget {
+        RouteTarget {
+            provider_id: Uuid::new_v4(),
+            provider_name: "p".into(),
+            provider_kind: ProviderKind::OpenAi,
+            base_url: "http://localhost".into(),
+            api_key: "k".into(),
+            model_name: model.into(),
+            upstream_model: model.into(),
+            input_price_per_million: 0.0,
+            output_price_per_million: 0.0,
+            capabilities: None,
+        }
+    }
+
+    /// Baut einen Stateless-State mit Lazy-Pools (werden nie angeruehrt) und
+    /// fueellt die drei Routing-Maps direkt.
+    async fn state_with(
+        routes: HashMap<String, Vec<RouteTarget>>,
+        fallbacks: HashMap<String, Vec<String>>,
+        redirects: HashMap<String, String>,
+    ) -> AppState {
+        let pg = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://user:pass@127.0.0.1:1/none")
+            .unwrap();
+        let (sink, _handle) = ingest::start(
+            clickhouse::Client::default(),
+            ingest::IngestConfig::default(),
+        );
+        let state = Arc::new(AppStateInner::new(
+            pg,
+            clickhouse::Client::default(),
+            reqwest::Client::new(),
+            sink,
+            "session-secret".into(),
+            "0".repeat(32),
+            Arc::new(tokio::sync::RwLock::new(MetricsSnapshot::default())),
+            None,
+        ));
+        *state.routes.write().await = routes;
+        *state.fallbacks.write().await = fallbacks;
+        *state.redirects.write().await = redirects;
+        state
+    }
+
+    fn model_names(targets: &Option<Vec<RouteTarget>>) -> Vec<String> {
+        targets
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| t.model_name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_resolve_no_redirect_unchanged() {
+        let mut routes = HashMap::new();
+        routes.insert("A".to_string(), vec![mk_target("A")]);
+        let mut fb = HashMap::new();
+        fb.insert("A".to_string(), vec!["B".to_string()]);
+        routes.insert("B".to_string(), vec![mk_target("B")]);
+
+        let state = state_with(routes, fb, HashMap::new()).await;
+        let resolved = state.resolve_route("A").await;
+        assert_eq!(resolved.effective, "A");
+        // altes Verhalten: primär A + Fallback B
+        assert_eq!(model_names(&resolved.targets), vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_redirect_applied() {
+        let mut routes = HashMap::new();
+        routes.insert("A".to_string(), vec![mk_target("A")]);
+        routes.insert("B".to_string(), vec![mk_target("B")]);
+
+        let mut redirects = HashMap::new();
+        redirects.insert("A".to_string(), "B".to_string());
+
+        let state = state_with(routes, HashMap::new(), redirects).await;
+        let resolved = state.resolve_route("A").await;
+        assert_eq!(resolved.effective, "B");
+        // Redirect-Ziel bedient: nur Bs Routes (As eigene nicht mehr)
+        assert_eq!(model_names(&resolved.targets), vec!["B".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_redirect_single_hop() {
+        // A -> B und B -> C: A loest auf B auf, NICHT weiter auf C.
+        let mut routes = HashMap::new();
+        routes.insert("B".to_string(), vec![mk_target("B")]);
+        routes.insert("C".to_string(), vec![mk_target("C")]);
+
+        let mut redirects = HashMap::new();
+        redirects.insert("A".to_string(), "B".to_string());
+        redirects.insert("B".to_string(), "C".to_string());
+
+        let state = state_with(routes, HashMap::new(), redirects).await;
+        let resolved = state.resolve_route("A").await;
+        assert_eq!(resolved.effective, "B");
+        assert_eq!(model_names(&resolved.targets), vec!["B".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_redirect_uses_target_fallbacks() {
+        // A -> B. Fallbacks von B greifen, Fallbacks von A NICHT.
+        let mut routes = HashMap::new();
+        routes.insert("A".to_string(), vec![mk_target("A")]);
+        routes.insert("B".to_string(), vec![mk_target("B")]);
+        routes.insert("C".to_string(), vec![mk_target("C")]);
+        routes.insert("D".to_string(), vec![mk_target("D")]);
+
+        let mut fb = HashMap::new();
+        fb.insert("B".to_string(), vec!["C".to_string()]);
+        fb.insert("A".to_string(), vec!["D".to_string()]); // darf nicht greifen
+
+        let mut redirects = HashMap::new();
+        redirects.insert("A".to_string(), "B".to_string());
+
+        let state = state_with(routes, fb, redirects).await;
+        let resolved = state.resolve_route("A").await;
+        assert_eq!(resolved.effective, "B");
+        // B + Bs Fallback C; As Fallback D fehlt
+        assert_eq!(model_names(&resolved.targets), vec!["B".to_string(), "C".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_dead_redirect_has_no_targets() {
+        // Redirect A -> B, aber B hat keine Route: effective=B, targets=None
+        // (der 503-"toter Redirect"-Fall).
+        let mut routes = HashMap::new();
+        routes.insert("A".to_string(), vec![mk_target("A")]);
+
+        let mut redirects = HashMap::new();
+        redirects.insert("A".to_string(), "B".to_string());
+
+        let state = state_with(routes, HashMap::new(), redirects).await;
+        let resolved = state.resolve_route("A").await;
+        assert_eq!(resolved.effective, "B");
+        assert!(resolved.targets.is_none());
     }
 }

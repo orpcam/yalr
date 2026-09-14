@@ -27,3 +27,6 @@ once_cell = { workspace = true }
 common = { path = "../common" }
 ingest = { path = "../ingest" }
 providers = { path = "../providers" }
+
+[dev-dependencies]
+reqwest = { workspace = true }

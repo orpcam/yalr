@@ -82,6 +82,9 @@ export interface CompletedInfo {
   first_byte_ms: number | null;
   is_fallback?: boolean;
   original_model?: string;
+  is_redirect?: boolean;
+  /** bedientes Modell (aus dem SSE-completed-Event; `entry.model` ist das angefragte) */
+  model?: string;
 }
 
 /**

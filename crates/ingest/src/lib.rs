@@ -46,9 +46,13 @@ pub struct RequestLog {
     pub request_truncated: bool,
     pub response_truncated: bool,
     /// Bedient durch Fallback: der bedienende Target hat ein anderes Modell
-    /// geliefert, als der Client angefragt hatte.
+    /// geliefert, als das (möglicherweise durch Redirect umgeroutete) Modell.
     pub is_fallback: bool,
-    /// Vom Client angefordertes Modell (vor Routing/Fallback).
+    /// Absichtsvoller Redirect aktiv — bedient durch das Redirect-Ziel
+    /// (effective != requested). Unabhängig von is_fallback (Redirect +
+    /// anschließender Fallback ⇒ beide true).
+    pub is_redirect: bool,
+    /// Vom Client angefordertes Modell (vor Redirect/Fallback).
     pub original_model: String,
     /// Anzahl der Target-Versuche bis zum bedienenden Target (0 = unbekannt,
     /// z.B. Alt-Daten oder Stream-Pfade ohne Attempt-Kontext).
@@ -76,6 +80,7 @@ pub struct LiveLog {
     pub duration_ms: u64,
     pub first_byte_ms: u64,
     pub is_fallback: bool,
+    pub is_redirect: bool,
     pub original_model: String,
     pub attempts_made: u8,
 }
@@ -101,6 +106,7 @@ impl From<&RequestLog> for LiveLog {
             duration_ms: log.duration_ms,
             first_byte_ms: log.first_byte_ms,
             is_fallback: log.is_fallback,
+            is_redirect: log.is_redirect,
             original_model: log.original_model.clone(),
             attempts_made: log.attempts_made,
         }
@@ -120,6 +126,10 @@ pub enum LiveEvent {
         model: String,
         endpoint: String,
         is_stream: bool,
+        /// Absichtsvoller Redirect aktiv (effective != requested).
+        is_redirect: bool,
+        /// Redirect-Ziel (effective) bei aktivem Redirect, sonst leer.
+        redirect_to: String,
     },
     FirstByte {
         request_id: String,
@@ -146,6 +156,10 @@ pub struct InFlightReq {
     pub key_name: String,
     pub started_at_ms: u64,
     pub first_byte_ms: Option<u64>,
+    /// Absichtsvoller Redirect aktiv (effective != requested).
+    pub is_redirect: bool,
+    /// Redirect-Ziel (effective) bei aktivem Redirect, sonst leer.
+    pub redirect_to: String,
 }
 
 /// Zähler-Zustand pro (provider, provider_name, model) seit Prozessstart.
@@ -306,6 +320,8 @@ impl LogSink {
                 provider,
                 provider_name,
                 model,
+                is_redirect,
+                redirect_to,
                 ..
             } => {
                 let mut guard = self.in_flight.lock().unwrap();
@@ -319,6 +335,8 @@ impl LogSink {
                         key_name: key_name.clone(),
                         started_at_ms: timestamp.timestamp_millis() as u64,
                         first_byte_ms: None,
+                        is_redirect: *is_redirect,
+                        redirect_to: redirect_to.clone(),
                     },
                 );
             }
@@ -592,6 +610,7 @@ pub async fn ensure_schema(client: &clickhouse::Client) -> anyhow::Result<()> {
                 request_truncated  Bool DEFAULT false,
                 response_truncated Bool DEFAULT false,
                 is_fallback       Bool DEFAULT false,
+                is_redirect       Bool DEFAULT false,
                 original_model    LowCardinality(String) DEFAULT '',
                 attempts_made     UInt8 DEFAULT 0,
                 provider_id   Nullable(UUID)
@@ -622,6 +641,10 @@ pub async fn ensure_schema(client: &clickhouse::Client) -> anyhow::Result<()> {
         .await?;
     client
         .query("ALTER TABLE yalr.request_logs ADD COLUMN IF NOT EXISTS is_fallback Bool DEFAULT false")
+        .execute()
+        .await?;
+    client
+        .query("ALTER TABLE yalr.request_logs ADD COLUMN IF NOT EXISTS is_redirect Bool DEFAULT false")
         .execute()
         .await?;
     client
@@ -679,6 +702,7 @@ mod tests {
             request_truncated: false,
             response_truncated: false,
             is_fallback: false,
+            is_redirect: false,
             original_model: "gpt-4o".into(),
             attempts_made: 1,
         };
@@ -715,6 +739,7 @@ mod tests {
             request_truncated: false,
             response_truncated: false,
             is_fallback: false,
+            is_redirect: false,
             original_model: String::new(),
             attempts_made: 0,
         };
@@ -763,6 +788,7 @@ mod tests {
             request_truncated: false,
             response_truncated: false,
             is_fallback: false,
+            is_redirect: false,
             original_model: String::new(),
             attempts_made: 0,
         };
@@ -801,6 +827,7 @@ mod tests {
             request_truncated: false,
             response_truncated: false,
             is_fallback: false,
+            is_redirect: false,
             original_model: String::new(),
             attempts_made: 0,
         }
@@ -1061,6 +1088,8 @@ mod tests {
             model: "gpt-4o".into(),
             endpoint: "/v1/chat/completions".into(),
             is_stream: true,
+            is_redirect: false,
+            redirect_to: String::new(),
         }
     }
 
@@ -1092,6 +1121,7 @@ mod tests {
                 duration_ms: 200,
                 first_byte_ms: 50,
                 is_fallback: false,
+                is_redirect: false,
                 original_model: "gpt-4o".into(),
                 attempts_made: 1,
             },
@@ -1124,6 +1154,33 @@ mod tests {
         let snapshot = sink.in_flight_snapshot();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].first_byte_ms, Some(42));
+    }
+
+    #[test]
+    fn test_inflight_started_captures_redirect_info() {
+        let sink = sink_with_counters();
+        let now_ms = Utc::now().timestamp_millis();
+        let ts = DateTime::from_timestamp_millis(now_ms).unwrap();
+        // Redirect aktiv: requested=A (im model-Feld), redirect_to=B
+        sink.emit(LiveEvent::RequestStarted {
+            request_id: "req-redir".into(),
+            timestamp: ts,
+            key_name: "k".into(),
+            provider: "openai".into(),
+            provider_name: "p".into(),
+            model: "A".into(),
+            endpoint: "/v1/chat/completions".into(),
+            is_stream: true,
+            is_redirect: true,
+            redirect_to: "B".into(),
+        });
+
+        let snapshot = sink.in_flight_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        // model bleibt das ANGEFRAGTE (A), Redirect-Ziel in redirect_to
+        assert_eq!(snapshot[0].model, "A");
+        assert_eq!(snapshot[0].is_redirect, true);
+        assert_eq!(snapshot[0].redirect_to, "B");
     }
 
     #[test]

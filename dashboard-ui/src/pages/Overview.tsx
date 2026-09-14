@@ -23,6 +23,7 @@ import {
   type TrackedRequest,
 } from "@/lib/live";
 import { Badge } from "@/components/ui/badge";
+import { ArrowRightLeft } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Sparkline } from "@/components/Sparkline";
@@ -235,6 +236,8 @@ export default function Overview() {
         first_byte_ms: log.first_byte_ms,
         is_fallback: log.is_fallback,
         original_model: log.original_model,
+        is_redirect: log.is_redirect,
+        model: log.model,
       };
     });
     return () => es.close();
@@ -573,6 +576,14 @@ export default function Overview() {
                 })}
               </p>
             )}
+            {stats && (stats.redirect_count ?? 0) > 0 && (
+              <p className="text-xs text-muted-foreground">
+                {t("via_redirect", {
+                  n: formatNumber(stats.redirect_count ?? 0),
+                  pct: formatPercent((stats.redirect_rate ?? 0) * 100, locale),
+                })}
+              </p>
+            )}
           </CardContent>
         </Card>
         <Card>
@@ -768,11 +779,20 @@ function LiveRequestRow({
             <>
               <span className="shrink-0 font-medium text-emerald-600 dark:text-emerald-400">{t("completed")}</span>
               <span className="min-w-0 max-w-56 truncate font-medium">{tr.entry.model}</span>
+              {c.is_redirect && (
+                <Badge
+                  variant="outline"
+                  className="shrink-0 whitespace-nowrap border-blue-500 text-blue-500"
+                  title={c.model ? `${c.original_model} → ${c.model}` : undefined}
+                >
+                  {t("redirect")}
+                </Badge>
+              )}
               {c.is_fallback && (
                 <Badge
                   variant="outline"
                   className="shrink-0 whitespace-nowrap border-yellow-500 text-yellow-500"
-                  title={c.original_model ? `${c.original_model} → ${tr.entry.model}` : undefined}
+                  title={c.model ? `${c.original_model} → ${c.model}` : undefined}
                 >
                   {t("fallback")}
                 </Badge>
@@ -799,6 +819,14 @@ function LiveRequestRow({
           ) : (
             <>
               <span className="min-w-0 max-w-56 truncate font-medium">{tr.entry.model}</span>
+              {tr.entry.is_redirect && (
+                <span
+                  className="shrink-0 text-blue-500/80"
+                  title={`${t("redirect")}: ${tr.entry.model} → ${tr.entry.redirect_to ?? "–"}`}
+                >
+                  <ArrowRightLeft className="h-3 w-3" />
+                </span>
+              )}
               <span className="min-w-0 max-w-32 truncate text-muted-foreground">{tr.entry.key_name}</span>
               <span className="shrink-0">
                 {t("running_for", { d: formatDuration(Math.max(0, now - tr.entry.started_at_ms)) })}

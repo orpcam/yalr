@@ -35,6 +35,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/dashboard-api/fallbacks", get(handlers::list_fallbacks))
         .route("/dashboard-api/fallbacks", post(handlers::create_fallback))
         .route("/dashboard-api/fallbacks/:id", axum::routing::delete(handlers::delete_fallback))
+        // redirects
+        .route("/dashboard-api/redirects", get(handlers::list_redirects))
+        .route("/dashboard-api/redirects", post(handlers::create_redirect))
+        .route("/dashboard-api/redirects/:id", axum::routing::delete(handlers::delete_redirect))
         // logs & stats
         .route("/dashboard-api/logs", get(handlers::list_logs))
         .route("/dashboard-api/logs/:id", get(handlers::get_log))

@@ -8,6 +8,8 @@ export class ApiError extends Error {
 
 interface ApiErrorResponse {
   error?: string;
+  /** konkrete Meldung des Backends (Validierung/Konflikt) — bevorzugt in ApiError.message */
+  detail?: string;
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -29,7 +31,8 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   }
   const body = await res.json().catch(() => ({} as ApiErrorResponse));
   if (!res.ok) {
-    throw new ApiError(res.status, (body as ApiErrorResponse).error ?? res.statusText);
+    const b = body as ApiErrorResponse;
+    throw new ApiError(res.status, b.detail ?? b.error ?? res.statusText);
   }
   return body as T;
 }
@@ -103,6 +106,15 @@ export interface Fallback {
   enabled: boolean;
 }
 
+export interface Redirect {
+  id: string;
+  model_name: string;
+  redirect_model_name: string;
+  note: string;
+  created_at: string;
+  target_has_route: boolean;
+}
+
 export interface LogEntry {
   id: string;
   request_id: string;
@@ -126,6 +138,8 @@ export interface LogEntry {
   is_fallback?: boolean;
   original_model?: string;
   attempts_made?: number;
+  /** Redirect-Info — optional: Alt-Daten haben das Feld nicht */
+  is_redirect?: boolean;
 }
 
 // ===== Live-Events (SSE /dashboard-api/live) =====
@@ -145,6 +159,12 @@ export type LiveEvent =
       model: string;
       endpoint: string;
       is_stream: boolean;
+      /** Redirect-Infos. Wire: vom Backend IMMER gesendet (is_redirect bool,
+       *  redirect_to = "" bei Nicht-Redirect, nie null/abwesend).
+       *  `?` nur als Alt-Daten-Toleranz. */
+      is_redirect?: boolean;
+      /** Redirect-Ziel ("" bei Nicht-Redirect). `?` nur als Alt-Daten-Toleranz. */
+      redirect_to?: string;
     }
   | { type: "first_byte"; request_id: string; first_byte_ms: number }
   | { type: "completed"; log: LiveLog };
@@ -161,6 +181,10 @@ export interface Stats {
   fallback_count?: number;
   /** 0..1, anteil der erfolgreichen requests */
   fallback_rate?: number;
+  /** Redirect-Stats — optional-tolerant behandeln */
+  redirect_count?: number;
+  /** 0..1, anteil der erfolgreichen requests */
+  redirect_rate?: number;
 }
 
 export interface TimeseriesPoint {
@@ -212,6 +236,11 @@ export interface InFlightRequest {
   /** epoch ms */
   started_at_ms: number;
   first_byte_ms: number | null;
+  /** Redirect-Infos. Wire: vom Backend IMMER gesendet (`redirect_to` = ""
+   *  bei Nicht-Redirect, nie null/abwesend). `?` nur als Alt-Daten-Toleranz.
+   *  `model` ist das ANGEFRAGTE Modell, `redirect_to` das Ziel. */
+  is_redirect?: boolean;
+  redirect_to?: string;
 }
 
 export interface LiveStats {

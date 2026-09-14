@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, LogEntry, VirtualKey, LiveEvent } from "@/lib/api";
+import { ArrowRightLeft } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -36,6 +37,8 @@ interface InFlight {
   model: string;
   is_stream: boolean;
   firstByteMs: number | null;
+  is_redirect?: boolean;
+  redirect_to?: string;
 }
 
 const PAGE_SIZES = [25, 50, 100, 250];
@@ -96,7 +99,19 @@ export default function Requests() {
       case "provider":
         return r.provider || "–";
       case "model":
-        return r.model || "–";
+        return (
+          <span className="inline-flex items-center gap-1.5">
+            {r.model || "–"}
+            {r.is_redirect && (
+              <span
+                className="shrink-0 text-blue-500/80"
+                title={`${t("redirect")}: ${r.model} → ${r.redirect_to ?? "–"}`}
+              >
+                <ArrowRightLeft className="h-3 w-3" />
+              </span>
+            )}
+          </span>
+        );
       case "stream":
         return r.is_stream ? "✓" : "";
       case "prompt_tokens":
@@ -160,6 +175,15 @@ export default function Requests() {
         render: (log) => (
           <span className="inline-flex items-center gap-1.5">
             {log.model || "–"}
+            {log.is_redirect && (
+              <Badge
+                variant="outline"
+                className="whitespace-nowrap border-blue-500 text-blue-500"
+                title={log.original_model ? `${log.original_model} → ${log.model}` : undefined}
+              >
+                {t("redirect")}
+              </Badge>
+            )}
             {log.is_fallback && (
               <Badge
                 variant="outline"
@@ -305,6 +329,8 @@ export default function Requests() {
           model: ev.model,
           is_stream: ev.is_stream,
           firstByteMs: null,
+          is_redirect: ev.is_redirect,
+          redirect_to: ev.redirect_to,
         },
         ...prev,
       ]);

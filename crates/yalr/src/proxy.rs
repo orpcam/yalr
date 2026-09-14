@@ -25,6 +25,69 @@ pub struct ProxyOutcome {
     pub log: RequestLog,
 }
 
+/// Routing-Kontext eines Requests, einmalig in `proxy()` nach `resolve_route`
+/// berechnet und durch den gesamten Call-Stack gereicht (execute_once ->
+/// provider-call -> stream-helfer -> log_stream_completion; analog build_log).
+///
+/// Bewusst NICHT zur Log-Zeit aus der redirects-Map neu gelesen (racy: ein
+/// Redirect kann mid-stream gelöscht werden) und NICHT aus target.model_name
+/// abgeleitet (das wäre bei Fallback das Ziel-Modell, nicht der effektive
+/// Name).
+#[derive(Debug, Clone)]
+struct RoutingInfo {
+    /// Vom Client angefordertes Modell (original_model im Log).
+    requested_model: String,
+    /// Effektives Modell nach max. EINEM Redirect-Hop.
+    effective_model: String,
+    /// true, wenn ein Redirect aktiv war (effective != requested).
+    is_redirect: bool,
+}
+
+impl RoutingInfo {
+    fn new(requested_model: String, effective_model: String) -> Self {
+        let is_redirect = effective_model != requested_model;
+        Self {
+            requested_model,
+            effective_model,
+            is_redirect,
+        }
+    }
+
+    /// Hat der bedienende Target ein anderes Modell als das effektive
+    /// (also ein Fallback) geliefert?  (is_fallback = served != effective.)
+    fn fallback_used(&self, served_model: &str) -> bool {
+        served_model != self.effective_model
+    }
+}
+
+/// Fehlerzustand, wenn `resolve_route` keine Targets liefert. Ein toter
+/// Redirect (Redirect aktiv, Ziel ohne Route) schlägt dem fehlenden Modell
+/// (404) VORAU, da die 404-Meldung sonst irreführend den Quellnamen nennt.
+struct ResolveFailure {
+    status: StatusCode,
+    error_type: &'static str,
+    message: String,
+}
+
+fn resolve_failure(routing: &RoutingInfo, requested_model: &str) -> ResolveFailure {
+    if routing.is_redirect {
+        ResolveFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error_type: "redirect_target_not_configured",
+            message: format!(
+                "redirect target '{}' has no enabled route",
+                routing.effective_model
+            ),
+        }
+    } else {
+        ResolveFailure {
+            status: StatusCode::NOT_FOUND,
+            error_type: "unknown_model",
+            message: format!("model '{requested_model}' is not configured"),
+        }
+    }
+}
+
 /// Behandelt `/v1/chat/completions`, `/v1/embeddings`, `/v1/messages` und `/v1/models`.
 pub async fn proxy(
     State(state): State<AppState>,
@@ -43,7 +106,7 @@ pub async fn proxy(
     let vk = match auth::authenticate(&state, &headers).await {
         Ok(vk) => vk,
         Err(status) => {
-            return error_response(state, None, &request_id, &endpoint, started, status, "auth", &status_text(&status), 0, &body).await;
+            return error_response(state, None, None, &request_id, &endpoint, started, status, "auth", &status_text(&status), 0, &body).await;
         }
     };
 
@@ -51,7 +114,7 @@ pub async fn proxy(
     let req_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            return error_response(state, Some(&vk), &request_id, &endpoint, started, StatusCode::BAD_REQUEST, "invalid_json", &e.to_string(), 0, &body).await;
+            return error_response(state, None, Some(&vk), &request_id, &endpoint, started, StatusCode::BAD_REQUEST, "invalid_json", &e.to_string(), 0, &body).await;
         }
     };
 
@@ -62,7 +125,7 @@ pub async fn proxy(
         .to_string();
 
     if requested_model.is_empty() {
-        return error_response(state, Some(&vk), &request_id, &endpoint, started, StatusCode::BAD_REQUEST, "missing_model", "request body has no 'model' field", 0, &body).await;
+        return error_response(state, None, Some(&vk), &request_id, &endpoint, started, StatusCode::BAD_REQUEST, "missing_model", "request body has no 'model' field", 0, &body).await;
     }
 
     // 3) Route aufloesen (hybrid: header-override gewinnt, sonst model-name)
@@ -71,10 +134,18 @@ pub async fn proxy(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let mut targets = match state.resolve_route(&requested_model).await {
+    let resolved = state.resolve_route(&requested_model).await;
+    // Routing-Kontext einMALIG hier berechnen und durch den Call-Stack reichen
+    // (s. RoutingInfo): is_redirect/is_fallback wären zur Log-Zeit sonst nicht
+    // mehr verlässlich ableitbar (Redirect koennte mid-stream gelöscht sein).
+    let routing = RoutingInfo::new(requested_model.clone(), resolved.effective);
+
+    let mut targets = match resolved.targets {
         Some(t) => t,
         None => {
-            return error_response(state, Some(&vk), &request_id, &endpoint, started, StatusCode::NOT_FOUND, "unknown_model", &format!("model '{requested_model}' is not configured"), 0, &body).await;
+            // toter Redirect (503) schlägt fehlendem Modell (404) voraus
+            let failure = resolve_failure(&routing, &requested_model);
+            return error_response(state, Some(&routing), Some(&vk), &request_id, &endpoint, started, failure.status, failure.error_type, &failure.message, 0, &body).await;
         }
     };
 
@@ -87,8 +158,15 @@ pub async fn proxy(
                 || t.provider_name == *override_name
         });
         if targets.is_empty() {
-            let msg = format!("no enabled provider '{override_name}' for model '{requested_model}'");
-            return error_response(state, Some(&vk), &request_id, &endpoint, started, StatusCode::NOT_FOUND, "unknown_provider", &msg, 0, &body).await;
+            // bei aktivem Redirect das effektive (Ziel-)Modell nennen, nicht
+            // den irreführenden Quellnamen
+            let model_for_msg = if routing.is_redirect {
+                routing.effective_model.clone()
+            } else {
+                requested_model.clone()
+            };
+            let msg = format!("no enabled provider '{override_name}' for model '{model_for_msg}'");
+            return error_response(state, Some(&routing), Some(&vk), &request_id, &endpoint, started, StatusCode::NOT_FOUND, "unknown_provider", &msg, 0, &body).await;
         }
         tracing::debug!("provider override '{override_name}' reduced targets {before} -> {}", targets.len());
     }
@@ -117,6 +195,12 @@ pub async fn proxy(
         model: requested_model.clone(),
         endpoint: endpoint.clone(),
         is_stream: wants_stream,
+        is_redirect: routing.is_redirect,
+        redirect_to: if routing.is_redirect {
+            routing.effective_model.clone()
+        } else {
+            String::new()
+        },
     });
 
     // 5) Request gegen Targets ausfuehren (retry + fallback)
@@ -125,7 +209,7 @@ pub async fn proxy(
     for (attempt, target) in targets.iter().enumerate() {
         attempts_made = attempts_made.saturating_add(1);
         let attempt_start = Instant::now();
-        match execute_once(&state, target, &vk, &endpoint, &req_json, &request_id, wants_stream, native_anthropic).await {
+        match execute_once(&state, target, &vk, &endpoint, &req_json, &request_id, wants_stream, native_anthropic, &routing).await {
             Ok(outcome) => {
                 // streaming wird separat geloggt (log_stream_completion), sobald der
                 // stream fertig ist - hier nicht doppelt loggen
@@ -141,6 +225,7 @@ pub async fn proxy(
                     &endpoint,
                     &req_json,
                     &target,
+                    &routing,
                     &outcome,
                     duration_ms,
                     attempt_start.elapsed().as_millis() as u64,
@@ -178,7 +263,7 @@ pub async fn proxy(
     let error_type = if matches!(err, ProviderError::Network(_)) { "provider_network" } else { "provider_error" };
     // attempts_made: nur die tatsächlich ausgefuehrten Versuche (früher Abbruch
     // bei nicht-retryablem Fehler zahlt nicht alle Targets der Route)
-    error_response(state, Some(&vk), &request_id, &endpoint, started, status, error_type, &err.to_string(), attempts_made.min(255), &body).await
+    error_response(state, Some(&routing), Some(&vk), &request_id, &endpoint, started, status, error_type, &err.to_string(), attempts_made.min(255), &body).await
 }
 
 /// Ein einzelner Provider-Versuch.
@@ -192,16 +277,17 @@ async fn execute_once(
     request_id: &str,
     wants_stream: bool,
     native_anthropic: bool,
+    routing: &RoutingInfo,
 ) -> Result<ProxyOutcome, ProviderError> {
     match target.provider_kind {
         ProviderKind::OpenAi | ProviderKind::OpenAiCompat => {
-            openai_call(state, target, vk, endpoint, req_json, request_id, wants_stream).await
+            openai_call(state, target, vk, endpoint, req_json, request_id, wants_stream, routing).await
         }
         ProviderKind::Anthropic => {
-            anthropic_call(state, target, vk, endpoint, req_json, request_id, wants_stream, native_anthropic).await
+            anthropic_call(state, target, vk, endpoint, req_json, request_id, wants_stream, native_anthropic, routing).await
         }
         ProviderKind::Gemini => {
-            gemini_call(state, target, vk, endpoint, req_json, request_id, wants_stream).await
+            gemini_call(state, target, vk, endpoint, req_json, request_id, wants_stream, routing).await
         }
     }
 }
@@ -218,6 +304,7 @@ async fn openai_call(
     req_json: &Value,
     request_id: &str,
     wants_stream: bool,
+    routing: &RoutingInfo,
 ) -> Result<ProxyOutcome, ProviderError> {
     let mut body = req_json.clone();
     if wants_stream {
@@ -249,7 +336,7 @@ async fn openai_call(
     if wants_stream && endpoint == "/v1/chat/completions" {
         // sse-durchreichen mit model-name rewrite
         let model_name = target.model_name.clone();
-        Ok(stream_sse_passthrough(state, target, vk, endpoint, req_json, request_id, resp, move |chunk| {
+        Ok(stream_sse_passthrough(state, target, vk, endpoint, req_json, request_id, resp, routing, move |chunk| {
             rewrite_stream_chunk_model(&chunk, &model_name).map(bytes::Bytes::from)
         }, StreamFormat::OpenAi)
         .await)
@@ -269,7 +356,7 @@ async fn openai_call(
         Ok(ProxyOutcome {
             response: json_response(StatusCode::OK, bytes::Bytes::from(bytes.clone())),
             log: build_log_from_response(
-                state, target, endpoint, req_json, StatusCode::OK,
+                state, target, routing, endpoint, req_json, StatusCode::OK,
                 &out, usage.0, usage.1, false, "",
             ),
         })
@@ -285,6 +372,7 @@ async fn anthropic_call(
     request_id: &str,
     wants_stream: bool,
     native_anthropic: bool,
+    routing: &RoutingInfo,
 ) -> Result<ProxyOutcome, ProviderError> {
     // 1) Request-Body im Zielformat bauen
     let (upstream_body, is_native) = if native_anthropic {
@@ -317,10 +405,10 @@ async fn anthropic_call(
     if wants_stream {
         if is_native {
             // nativer anthropic-stream: 1:1 durchreichen
-            Ok(stream_sse_passthrough(state, target, vk, endpoint, req_json, request_id, resp, |chunk| Some(chunk), StreamFormat::Anthropic).await)
+            Ok(stream_sse_passthrough(state, target, vk, endpoint, req_json, request_id, resp, routing, |chunk| Some(chunk), StreamFormat::Anthropic).await)
         } else {
             // anthropic-stream -> openai-chunks uebersetzen
-            Ok(stream_anthropic_to_openai(state, target, vk, endpoint, req_json, request_id, resp).await)
+            Ok(stream_anthropic_to_openai(state, target, vk, endpoint, req_json, request_id, resp, routing).await)
         }
     } else {
         let bytes = resp.bytes().await?;
@@ -345,7 +433,7 @@ async fn anthropic_call(
         Ok(ProxyOutcome {
             response: json_response(StatusCode::OK, bytes::Bytes::from(bytes)),
             log: build_log_from_response(
-                state, target, endpoint, req_json, StatusCode::OK,
+                state, target, routing, endpoint, req_json, StatusCode::OK,
                 &log_resp_json, usage.0, usage.1, false, "",
             ),
         })
@@ -360,6 +448,7 @@ async fn gemini_call(
     req_json: &Value,
     request_id: &str,
     wants_stream: bool,
+    routing: &RoutingInfo,
 ) -> Result<ProxyOutcome, ProviderError> {
     if endpoint != "/v1/chat/completions" {
         return Err(ProviderError::Status {
@@ -387,7 +476,7 @@ async fn gemini_call(
 
     if wants_stream {
         // gemini SSE -> openai chunks
-        Ok(stream_gemini_to_openai(state, target, vk, endpoint, req_json, request_id, resp).await)
+        Ok(stream_gemini_to_openai(state, target, vk, endpoint, req_json, request_id, resp, routing).await)
     } else {
         let bytes = resp.bytes().await?;
         let gemini_resp: Value = serde_json::from_slice(&bytes)
@@ -407,7 +496,7 @@ async fn gemini_call(
         Ok(ProxyOutcome {
             response: json_response(StatusCode::OK, bytes::Bytes::from(bytes)),
             log: build_log_from_response(
-                state, target, endpoint, req_json, StatusCode::OK,
+                state, target, routing, endpoint, req_json, StatusCode::OK,
                 &out, usage.0, usage.1, false, "",
             ),
         })
@@ -499,6 +588,7 @@ async fn stream_sse_passthrough<F>(
     req_json: &Value,
     request_id: &str,
     resp: reqwest::Response,
+    routing: &RoutingInfo,
     rewrite: F,
     log_format: StreamFormat,
 ) -> ProxyOutcome
@@ -564,6 +654,7 @@ where
     log_stream_completion(
         state.clone(),
         target.clone(),
+        routing.clone(),
         vk.clone(),
         request_id.to_string(),
         endpoint.to_string(),
@@ -600,6 +691,7 @@ async fn stream_anthropic_to_openai(
     req_json: &Value,
     request_id: &str,
     resp: reqwest::Response,
+    routing: &RoutingInfo,
 ) -> ProxyOutcome {
     let started = Instant::now();
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(100);
@@ -719,6 +811,7 @@ async fn stream_anthropic_to_openai(
     log_stream_completion(
         state.clone(),
         target.clone(),
+        routing.clone(),
         vk.clone(),
         request_id.to_string(),
         endpoint.to_string(),
@@ -752,6 +845,7 @@ async fn stream_gemini_to_openai(
     req_json: &Value,
     request_id: &str,
     resp: reqwest::Response,
+    routing: &RoutingInfo,
 ) -> ProxyOutcome {
     let started = Instant::now();
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(100);
@@ -842,6 +936,7 @@ async fn stream_gemini_to_openai(
     log_stream_completion(
         state.clone(),
         target.clone(),
+        routing.clone(),
         vk.clone(),
         request_id.to_string(),
         endpoint.to_string(),
@@ -873,6 +968,7 @@ async fn stream_gemini_to_openai(
 fn log_stream_completion(
     state: AppState,
     target: RouteTarget,
+    routing: RoutingInfo,
     vk: common::state::VirtualKey,
     request_id: String,
     endpoint: String,
@@ -914,15 +1010,13 @@ fn log_stream_completion(
             error_message = em;
         }
 
-        // Fallback-Erkennung: das bedienende Target lieferte ein anderes
-        // Modell, als der Client anfragte (kein attempt-basierter Vergleich,
-        // das wuerde Multi-Provider-Primärrouten falsch markieren).
-        let requested_model = req_json
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let is_fallback = target.model_name != requested_model;
+        // Redirect-/Fallback-Erkennung aus dem in proxy() einmalig berechneten
+        // Routing-Kontext — NICHT aus der redirects-Map neu lesen (racy: der
+        // Redirect koennte mid-stream gelöscht sein) und NICHT aus
+        // target.model_name ableiten (bei Fallback wäre das das Ziel-Modell).
+        let requested_model = routing.requested_model.clone();
+        let is_fallback = routing.fallback_used(&target.model_name);
+        let is_redirect = routing.is_redirect;
 
         let estimated_prompt = if prompt_tokens > 0 {
             prompt_tokens
@@ -966,6 +1060,7 @@ fn log_stream_completion(
                 duration_ms,
                 first_byte_ms,
                 is_fallback,
+                is_redirect,
                 original_model: requested_model.clone(),
                 // attempts_made: der attempt-index steht hier nicht zur
                 // verfuegung (er liegt in der retry-loop von proxy(); ein
@@ -1010,6 +1105,7 @@ fn log_stream_completion(
             request_truncated: false,
             response_truncated: false,
             is_fallback,
+            is_redirect,
             original_model: requested_model,
             // wie im Live-Event: attempt-index hier nicht verfuegbar -> unbekannt
             attempts_made: 0,
@@ -1404,6 +1500,7 @@ fn build_log(
     endpoint: &str,
     req_json: &Value,
     target: &RouteTarget,
+    routing: &RoutingInfo,
     outcome: &ProxyOutcome,
     duration_ms: u64,
     _upstream_ms: u64,
@@ -1418,14 +1515,12 @@ fn build_log(
     let error_message = outcome.log.error_message.clone();
     let error_type = outcome.log.error_type.clone();
     let first_byte_ms = outcome.log.first_byte_ms;
-    // Fallback-Erkennung: das bedienende Target lieferte ein anderes Modell,
-    // als der Client anfragte.
-    let requested_model = req_json
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let is_fallback = target.model_name != requested_model;
+    // Redirect-/Fallback-Erkennung aus dem Routing-Kontext (siehe
+    // RoutingInfo): is_redirect = effective != requested, is_fallback =
+    // served != effective.
+    let requested_model = routing.requested_model.clone();
+    let is_fallback = routing.fallback_used(&target.model_name);
+    let is_redirect = routing.is_redirect;
     let attempts_made = (attempt + 1) as u8;
 
     RequestLog {
@@ -1455,6 +1550,7 @@ fn build_log(
         request_truncated: false,
         response_truncated: false,
         is_fallback,
+        is_redirect,
         original_model: requested_model,
         attempts_made,
     }
@@ -1468,6 +1564,7 @@ fn extract_log_usage(log: &RequestLog) -> (u64, u64) {
 fn build_log_from_response(
     _state: &AppState,
     target: &RouteTarget,
+    routing: &RoutingInfo,
     endpoint: &str,
     req_json: &Value,
     status: StatusCode,
@@ -1509,11 +1606,12 @@ fn build_log_from_response(
         response_body: serde_json::to_string(resp_json).unwrap_or_default(),
         request_truncated: false,
         response_truncated: false,
-        // Fallback-Felder bleiben Default: dieses Log ist nur der
+        // Redirect-/Fallback-Felder korrekt setzen (dieser Log ist nur der
         // Zwischenträger für den outcome und wird nie persistiert — der
-        // persistierte Log kommt aus build_log mit den echten Werten.
-        is_fallback: false,
-        original_model: String::new(),
+        // persistierte Log kommt aus build_log mit den echten Werten).
+        is_fallback: routing.fallback_used(&target.model_name),
+        is_redirect: routing.is_redirect,
+        original_model: routing.requested_model.clone(),
         attempts_made: 0,
     }
 }
@@ -1546,6 +1644,7 @@ fn empty_log(_state: &AppState, _target: &RouteTarget, _endpoint: &str, _req_jso
         request_truncated: false,
         response_truncated: false,
         is_fallback: false,
+        is_redirect: false,
         original_model: String::new(),
         attempts_made: 0,
     }
@@ -1554,6 +1653,7 @@ fn empty_log(_state: &AppState, _target: &RouteTarget, _endpoint: &str, _req_jso
 #[allow(clippy::too_many_arguments)]
 async fn error_response(
     state: AppState,
+    routing: Option<&RoutingInfo>,
     vk: Option<&common::state::VirtualKey>,
     request_id: &str,
     endpoint: &str,
@@ -1566,13 +1666,19 @@ async fn error_response(
     req_body: &bytes::Bytes,
 ) -> Response {
     let duration_ms = started.elapsed().as_millis() as u64;
-    // original_model aus dem Request-Body parsen (best-effort, u.a. bei
-    // invalid_json leer): vermeidet einen Parameter an allen Call-Sites,
-    // die vor der Body-Auswertung abbrechen.
-    let original_model = serde_json::from_slice::<Value>(req_body)
-        .ok()
-        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
-        .unwrap_or_default();
+    // original_model: bei vorhandenem Routing-Kontext (Fehler NACH resolve) der
+    // client-angefragte Name aus dem Kontext; sonst (Fehler VOR resolve, u.a.
+    // invalid_json) best-effort aus dem Body (dann leer).
+    let original_model = match routing {
+        Some(r) => r.requested_model.clone(),
+        None => serde_json::from_slice::<Value>(req_body)
+            .ok()
+            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+            .unwrap_or_default(),
+    };
+    // is_redirect kann auch bei Fehlern true sein (toter Redirect: Ziel ohne
+    // Route) — is_fallback bleibt hier immer false (kein Target bedient).
+    let is_redirect = routing.map(|r| r.is_redirect).unwrap_or(false);
     let log = RequestLog {
         id: Uuid::new_v4(),
         request_id: request_id.to_string(),
@@ -1602,6 +1708,7 @@ async fn error_response(
         // Semantik: "bedient von Fallback" — hier ist kein Target bedient
         // worden, daher immer false.
         is_fallback: false,
+        is_redirect,
         original_model,
         attempts_made,
     };
@@ -1981,5 +2088,55 @@ mod tests {
         assert!(full.ends_with(b"TAIL"));
         // spaeter fehler ist nach dem drain sichtbar
         assert_eq!(health.transport_error().as_deref(), Some("late transport error"));
+    }
+
+    // --- Redirect/Fallback-Feldberechnung (geteilt von build_log und
+    //     log_stream_completion; beide lesen routing.is_redirect und
+    //     routing.fallback_used(served_model)) ---
+
+    #[test]
+    fn test_routing_flags_pure() {
+        // kein Redirect, bedient vom angefragten Modell
+        let r = RoutingInfo::new("A".into(), "A".into());
+        assert!(!r.is_redirect);
+        assert!(!r.fallback_used("A"));
+    }
+
+    #[test]
+    fn test_routing_flags_redirect_served_by_target() {
+        // Redirect A->B, bedient von B: redirect, aber kein Fallback
+        let r = RoutingInfo::new("A".into(), "B".into());
+        assert!(r.is_redirect);
+        assert!(!r.fallback_used("B"));
+    }
+
+    #[test]
+    fn test_routing_flags_redirect_then_fallback() {
+        // Redirect A->B, Bs Fallback C bedient: redirect UND Fallback
+        let r = RoutingInfo::new("A".into(), "B".into());
+        assert!(r.is_redirect);
+        assert!(r.fallback_used("C"));
+        // der effektive Name selbst zaeHLT nie als Fallback
+        assert!(!r.fallback_used("B"));
+    }
+
+    // --- toter Redirect: 503 schlägt 404 voraus ---
+
+    #[test]
+    fn test_resolve_failure_dead_redirect_wins_over_404() {
+        // Redirect aktiv, Ziel ohne Route: 503, nennt das Ziel-Modell
+        let r = RoutingInfo::new("A".into(), "B".into());
+        let f = resolve_failure(&r, "A");
+        assert_eq!(f.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(f.error_type, "redirect_target_not_configured");
+        assert!(f.message.contains("B"), "{}", f.message);
+        assert!(!f.message.contains("'A'"), "{}", f.message);
+
+        // ohne Redirect: 404, nennt das angefragte Modell
+        let r = RoutingInfo::new("A".into(), "A".into());
+        let f = resolve_failure(&r, "A");
+        assert_eq!(f.status, StatusCode::NOT_FOUND);
+        assert_eq!(f.error_type, "unknown_model");
+        assert!(f.message.contains("A"), "{}", f.message);
     }
 }

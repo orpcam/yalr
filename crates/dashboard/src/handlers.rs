@@ -1531,6 +1531,248 @@ pub async fn delete_fallback(
 }
 
 // ============================================================
+// Redirects (temporaere Modell-Redirects: A -> B, max. EIN Hop)
+// ============================================================
+
+#[derive(sqlx::FromRow)]
+struct RedirectRow {
+    id: Uuid,
+    model_name: String,
+    redirect_model_name: String,
+    note: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateRedirectRequest {
+    pub model_name: String,
+    pub redirect_model_name: String,
+    pub note: Option<String>,
+}
+
+/// Kombiniert die reinen Redirect-Validierungsregeln. Die DB-/In-Memory-
+/// Bedingungen rechnet der Handler aus und uebergeben sie als Boolesche.
+/// `None` = gueltig, sonst 400-Fehlertext.
+fn redirect_validation_error(
+    source: &str,
+    target: &str,
+    target_has_route: bool,
+    target_is_redirect_source: bool,
+    source_in_target_fallbacks: bool,
+) -> Option<&'static str> {
+    if source == target {
+        return Some("model_name und redirect_model_name muessen unterschiedlich sein");
+    }
+    if !target_has_route {
+        return Some("redirect_model_name hat aktuell keine aktive Route");
+    }
+    if target_is_redirect_source {
+        return Some("redirect_model_name ist selbst Redirect-Quelle (keine Verkettung)");
+    }
+    if source_in_target_fallbacks {
+        return Some("Quellmodell ist aktives Fallback des Redirect-Ziels (Zyklus)");
+    }
+    None
+}
+
+/// Ein Redirect als JSON-Objekt (inkl. `target_has_route` fuer die
+/// "toter Redirect"-Warnung im Frontend).
+fn redirect_json(r: &RedirectRow, target_has_route: bool) -> Value {
+    json!({
+        "id": r.id,
+        "model_name": r.model_name,
+        "redirect_model_name": r.redirect_model_name,
+        "note": r.note,
+        "created_at": r.created_at,
+        "target_has_route": target_has_route,
+    })
+}
+
+pub async fn list_redirects(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if auth::require_session(&state, &headers).await.is_err() {
+        return unauthorized();
+    }
+    let rows =
+        sqlx::query_as::<_, RedirectRow>(
+            "SELECT id, model_name, redirect_model_name, note, created_at FROM redirects ORDER BY model_name",
+        )
+        .fetch_all(&state.pg)
+        .await;
+
+    match rows {
+        Ok(rows) => {
+            let routes = state.routes.read().await;
+            // Vertrag: nacktes JSON-Array (kein Objekt-Wrapper wie bei /fallbacks)
+            let redirects: Vec<_> = rows
+                .iter()
+                .map(|r| redirect_json(r, routes.contains_key(&r.redirect_model_name)))
+                .collect();
+            Json(json!(redirects)).into_response()
+        }
+        Err(e) => server_error(e),
+    }
+}
+
+pub async fn create_redirect(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateRedirectRequest>,
+) -> Response {
+    if auth::require_session(&state, &headers).await.is_err() {
+        return unauthorized();
+    }
+    let source = req.model_name.trim();
+    let target = req.redirect_model_name.trim();
+
+    // Beide Modelle muessen in der models-Tabelle existieren (unabhaengig von enabled)
+    let found: Vec<String> = match sqlx::query_scalar(
+        "SELECT model_name FROM models WHERE model_name IN ($1, $2)",
+    )
+    .bind(source)
+    .bind(target)
+    .fetch_all(&state.pg)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    if !found.iter().any(|m| m == source) {
+        return bad_request(&format!("model '{source}' existiert nicht"));
+    }
+    if !found.iter().any(|m| m == target) {
+        return bad_request(&format!("redirect_model_name '{target}' existiert nicht"));
+    }
+
+    // Ziel muss aktuell eine aktive Route haben (verhindert tote Redirects).
+    // Best-effort gegen den In-Memory-Stand (state.routes), NICHT in der TX
+    // gegen die DB: ein danach deaktiviertes Ziel erzeugt einen toten
+    // Redirect, der vom Proxy sauber mit 503 beantwortet wird und in der
+    // Redirect-Liste als target_has_route=false markiert ist.
+    let target_has_route = {
+        let routes = state.routes.read().await;
+        routes.contains_key(target)
+    };
+
+    // Kette- und Zyklus-Checks + INSERT in einer Transaktion.
+    // TOCTOU: zwei parallele POSTs koennen die Ketten-Pruefung unter
+    // READ COMMITTED beide passieren (Check-then-Insert). Bewusst
+    // akzeptiert: resolve_route ist Single-Hop, und eine so entstandene
+    // Kette A->B->C bleibt zur Laufzeit harmlos — A loest nur auf B auf,
+    // B->C betrifft nur Direkt-Requests auf B.
+    let mut tx = match state.pg.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return server_error(e),
+    };
+    let target_is_redirect_source = match sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM redirects WHERE model_name = $1",
+    )
+    .bind(target)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(r) => r.is_some(),
+        Err(e) => {
+            let _ = tx.rollback().await;
+            return server_error(e);
+        }
+    };
+    let source_in_target_fallbacks = match sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM fallbacks WHERE model_name = $1 AND fallback_model_name = $2 AND enabled",
+    )
+    .bind(target)
+    .bind(source)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(r) => r.is_some(),
+        Err(e) => {
+            let _ = tx.rollback().await;
+            return server_error(e);
+        }
+    };
+
+    if let Some(msg) = redirect_validation_error(
+        source,
+        target,
+        target_has_route,
+        target_is_redirect_source,
+        source_in_target_fallbacks,
+    ) {
+        let _ = tx.rollback().await;
+        return bad_request(msg);
+    }
+
+    let note = req.note.as_deref().map(str::trim).unwrap_or_default();
+    let res = sqlx::query(
+        "INSERT INTO redirects (id, model_name, redirect_model_name, note) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(source)
+    .bind(target)
+    .bind(note)
+    .execute(&mut *tx)
+    .await;
+
+    match res {
+        Ok(_) => {
+            if let Err(e) = tx.commit().await {
+                return server_error(e);
+            }
+            let _ = state.reload_routes().await;
+            // neuen Eintrag zurueckgeben (inkl. target_has_route)
+            let row = sqlx::query_as::<_, RedirectRow>(
+                "SELECT id, model_name, redirect_model_name, note, created_at FROM redirects WHERE model_name = $1",
+            )
+            .bind(source)
+            .fetch_one(&state.pg)
+            .await;
+            match row {
+                Ok(r) => {
+                    let routes = state.routes.read().await;
+                    Json(redirect_json(&r, routes.contains_key(&r.redirect_model_name)))
+                        .into_response()
+                }
+                Err(e) => server_error(e),
+            }
+        }
+        Err(e) => {
+            let _ = tx.rollback().await;
+            // UNIQUE-Verletzung: Quelle hat schon einen Redirect
+            if matches!(&e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")) {
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": "conflict", "detail": format!("'{source}' hat bereits einen Redirect")})),
+                )
+                    .into_response()
+            } else {
+                server_error(e)
+            }
+        }
+    }
+}
+
+pub async fn delete_redirect(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Response {
+    if auth::require_session(&state, &headers).await.is_err() {
+        return unauthorized();
+    }
+    let res = sqlx::query("DELETE FROM redirects WHERE id = $1")
+        .bind(id)
+        .execute(&state.pg)
+        .await;
+    match res {
+        Ok(_) => {
+            let _ = state.reload_routes().await;
+            Json(json!({"ok": true})).into_response()
+        }
+        Err(e) => server_error(e),
+    }
+}
+
+// ============================================================
 // Logs & Stats (ClickHouse)
 // ============================================================
 
@@ -1583,7 +1825,7 @@ pub async fn list_logs(
     let sql = format!(
         r#"
         SELECT id, request_id, timestamp, key_name, provider, provider_name, provider_id,
-               model, original_model, attempts_made, is_fallback, upstream_model, endpoint, status, error_type, is_stream,
+               model, original_model, attempts_made, is_fallback, is_redirect, upstream_model, endpoint, status, error_type, is_stream,
                prompt_tokens, completion_tokens, cost_usd, duration_ms, first_byte_ms
         FROM yalr.request_logs
         WHERE {where_sql}
@@ -1647,6 +1889,7 @@ pub async fn list_logs(
         original_model: String,
         attempts_made: u8,
         is_fallback: bool,
+        is_redirect: bool,
         upstream_model: String,
         endpoint: String,
         status: u16,
@@ -1690,6 +1933,7 @@ pub async fn list_logs(
                         "original_model": r.original_model,
                         "attempts_made": r.attempts_made,
                         "is_fallback": r.is_fallback,
+                        "is_redirect": r.is_redirect,
                         "upstream_model": r.upstream_model,
                         "endpoint": r.endpoint,
                         "status": r.status,
@@ -1741,6 +1985,7 @@ pub async fn get_log(
         original_model: String,
         attempts_made: u8,
         is_fallback: bool,
+        is_redirect: bool,
         upstream_model: String,
         endpoint: String,
         status: u16,
@@ -1764,7 +2009,7 @@ pub async fn get_log(
         .query(
             r#"
             SELECT id, request_id, timestamp, key_name, provider, provider_name, provider_id,
-                   model, original_model, attempts_made, is_fallback, upstream_model, endpoint, status, error_message, error_type,
+                   model, original_model, attempts_made, is_fallback, is_redirect, upstream_model, endpoint, status, error_message, error_type,
                    is_stream, prompt_tokens, completion_tokens, cost_usd,
                    duration_ms, first_byte_ms, request_body, response_body,
                    request_truncated, response_truncated
@@ -1900,7 +2145,10 @@ pub async fn stats(
             sum(duration_ms) / greatest(count(), 1) AS avg_duration_ms,
             countIf(is_fallback) AS fallback_count,
             toFloat64(countIf(is_fallback AND status >= 200 AND status < 300))
-                / greatest(countIf(status >= 200 AND status < 300), 1) AS fallback_rate
+                / greatest(countIf(status >= 200 AND status < 300), 1) AS fallback_rate,
+            countIf(is_redirect) AS redirect_count,
+            toFloat64(countIf(is_redirect AND status >= 200 AND status < 300))
+                / greatest(countIf(status >= 200 AND status < 300), 1) AS redirect_rate
         FROM yalr.request_logs
         {where_sql}
         "#
@@ -1932,6 +2180,8 @@ pub async fn stats(
         avg_duration_ms: f64,
         fallback_count: u64,
         fallback_rate: f64,
+        redirect_count: u64,
+        redirect_rate: f64,
     }
 
     match query.fetch_one::<StatsRow>().await {
@@ -4320,6 +4570,8 @@ mod metrics_tests {
             key_name: "k".into(),
             started_at_ms: 0,
             first_byte_ms: None,
+            is_redirect: false,
+            redirect_to: String::new(),
         };
         let in_flight = vec![
             mk("a", "p1", "N1"),
@@ -4819,6 +5071,8 @@ yalr_upstream_rate_window_seconds{provider="p"} 2.5
             key_name: key.into(),
             started_at_ms: 0,
             first_byte_ms: None,
+            is_redirect: false,
+            redirect_to: String::new(),
         };
 
         let snapshot = vec![mk("a", "key1"), mk("b", "key2"), mk("c", "key1")];
@@ -4897,6 +5151,307 @@ yalr_upstream_rate_window_seconds{provider="p"} 2.5
         let expected_next = if i + 1 < BUCKETS.len() { BUCKETS[i + 1] } else { 720 };
         assert_eq!(super::pick_bucket_hours(*plusOne), expected_next);
       }
+    }
+}
+
+// ============================================================
+// Redirect-Tests
+// ============================================================
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::*;
+    use common::state::{AppStateInner, MetricsSnapshot};
+    use providers::{ProviderKind, RouteTarget};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    #[test]
+    fn test_redirect_validation_rejects_self() {
+        assert!(redirect_validation_error("A", "A", true, false, false).is_some());
+    }
+
+    #[test]
+    fn test_redirect_validation_rejects_target_without_route() {
+        assert!(redirect_validation_error("A", "B", false, false, false).is_some());
+    }
+
+    #[test]
+    fn test_redirect_validation_rejects_chain() {
+        assert!(redirect_validation_error("A", "B", true, true, false).is_some());
+    }
+
+    #[test]
+    fn test_redirect_validation_rejects_fallback_cycle() {
+        assert!(redirect_validation_error("A", "B", true, false, true).is_some());
+    }
+
+    #[test]
+    fn test_redirect_validation_accepts_valid() {
+        assert_eq!(redirect_validation_error("A", "B", true, false, false), None);
+    }
+
+    // ---- Integration-Tests (nur mit DASHBOARD_TEST_DATABASE_URL) ----
+    //
+    // Das Crate hat ansonsten keine DB-Test-Infrastruktur (alle Bestands-Tests
+    // sind rein). Ohne gesetzte Env-Variable sind die Tests No-Ops, damit
+    // `cargo test` ohne Postgres gruen bleibt.
+
+    fn test_db_url() -> Option<String> {
+        std::env::var("DASHBOARD_TEST_DATABASE_URL").ok().filter(|s| !s.is_empty())
+    }
+
+    async fn test_state() -> Option<AppState> {
+        let url = test_db_url()?;
+        let pg = sqlx::PgPool::connect(&url).await.ok()?;
+        sqlx::migrate!("../../migrations").run(&pg).await.ok()?;
+        let (sink, _handle) = ingest::start(
+            clickhouse::Client::default(),
+            ingest::IngestConfig::default(),
+        );
+        Some(Arc::new(AppStateInner::new(
+            pg,
+            clickhouse::Client::default(),
+            reqwest::Client::new(),
+            sink,
+            "session-secret".into(),
+            "0".repeat(32),
+            Arc::new(RwLock::new(MetricsSnapshot::default())),
+            None,
+        )))
+    }
+
+    async fn seed_session(pg: &sqlx::PgPool) -> Option<String> {
+        let username = format!("redirect-test-{}", Uuid::new_v4().simple());
+        crate::auth::ensure_admin_user(pg, &username, "test-password-123")
+            .await
+            .ok()?;
+        crate::auth::create_session(pg, &username).await.ok()
+    }
+
+    fn auth_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cookie",
+            format!("{}={token}", crate::auth::SESSION_COOKIE)
+                .parse()
+                .unwrap(),
+        );
+        h
+    }
+
+    async fn body_json(res: Response) -> Value {
+        let (_parts, body) = res.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn mk_target(pid: Uuid, name: &str) -> RouteTarget {
+        RouteTarget {
+            provider_id: pid,
+            provider_name: "seed".into(),
+            provider_kind: ProviderKind::parse("openai").unwrap(),
+            base_url: "http://localhost".into(),
+            api_key: "k".into(),
+            model_name: name.to_string(),
+            upstream_model: name.to_string(),
+            input_price_per_million: 0.0,
+            output_price_per_million: 0.0,
+            capabilities: None,
+        }
+    }
+
+    /// Legt einen Seed-Provider + Modelle an und spiegelt sie in state.routes
+    /// (aktiv). Returns provider-id fuer das Cleanup.
+    async fn seed_models(pg: &sqlx::PgPool, state: &AppState, names: &[&str]) -> Uuid {
+        let pid = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO providers (id, name, kind, base_url, api_key_encrypted, enabled) VALUES ($1, $2, 'openai', 'http://localhost', 'x', true)",
+        )
+        .bind(pid)
+        .bind(format!("seed-{}", Uuid::new_v4().simple()))
+        .execute(pg)
+        .await
+        .unwrap();
+        let mut routes: HashMap<String, Vec<RouteTarget>> = HashMap::new();
+        for n in names {
+            sqlx::query(
+                "INSERT INTO models (id, provider_id, model_name, upstream_model) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(pid)
+            .bind(*n)
+            .bind(*n)
+            .execute(pg)
+            .await
+            .unwrap();
+            routes.insert((*n).to_string(), vec![mk_target(pid, n)]);
+        }
+        *state.routes.write().await = routes;
+        pid
+    }
+
+    async fn create_call(
+        state: &AppState,
+        headers: &HeaderMap,
+        source: &str,
+        target: &str,
+    ) -> Response {
+        create_redirect(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateRedirectRequest {
+                model_name: source.to_string(),
+                redirect_model_name: target.to_string(),
+                note: None,
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_redirect_crud_roundtrip() {
+        let Some(state) = test_state().await else { return };
+        let pg = state.pg.clone();
+        let Some(token) = seed_session(&pg).await else { return };
+        let headers = auth_headers(&token);
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let source = format!("red-src-{suffix}");
+        let target = format!("red-tgt-{suffix}");
+        let pid = seed_models(&pg, &state, &[&source, &target]).await;
+
+        // list: nacked JSON-Array, eigener Eintrag fehlt noch
+        let v = body_json(list_redirects(State(state.clone()), headers.clone()).await).await;
+        let arr = v.as_array().expect("nacktes Array");
+        assert!(!arr.iter().any(|e| e["model_name"] == json!(source)));
+
+        // create: erfolgreich, Eintrag inkl. target_has_route zurueck
+        let res = create_call(&state, &headers, &source, &target).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let created = body_json(res).await;
+        assert_eq!(created["model_name"], json!(source));
+        assert_eq!(created["redirect_model_name"], json!(target));
+        assert!(created["target_has_route"].as_bool().unwrap());
+        let id = created["id"].clone();
+
+        // list: Eintrag da, target_has_route = true
+        let v = body_json(list_redirects(State(state.clone()), headers.clone()).await).await;
+        let entry = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["model_name"] == json!(source))
+            .unwrap();
+        assert_eq!(entry["id"], id);
+        assert!(entry["target_has_route"].as_bool().unwrap());
+
+        // duplicate (Quelle hat schon einen Redirect) -> 409
+        let res = create_call(&state, &headers, &source, &target).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        // delete: danach wieder weg
+        let id: Uuid = serde_json::from_value(id).unwrap();
+        let res = delete_redirect(State(state.clone()), headers.clone(), Path(id)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(list_redirects(State(state.clone()), headers).await).await;
+        assert!(!v
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["model_name"] == json!(source)));
+
+        // cleanup (Provider-Delete cascaded Models)
+        let _ = sqlx::query("DELETE FROM providers WHERE id = $1")
+            .bind(pid)
+            .execute(&pg)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_redirect_create_validation_rejects() {
+        let Some(state) = test_state().await else { return };
+        let pg = state.pg.clone();
+        let Some(token) = seed_session(&pg).await else { return };
+        let headers = auth_headers(&token);
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let a = format!("red-a-{suffix}");
+        let b = format!("red-b-{suffix}");
+        let no_route = format!("red-noroute-{suffix}");
+        let f = format!("red-f-{suffix}");
+        let g = format!("red-g-{suffix}");
+        let h = format!("red-h-{suffix}");
+        let d = format!("red-d-{suffix}");
+        let e = format!("red-e-{suffix}");
+        let pid = seed_models(
+            &pg,
+            &state,
+            &[&a, &b, &f, &g, &h, &d, &e],
+        )
+        .await;
+        // no_route: existiert in models, aber hat bewusst keine aktive Route
+        // (nicht in state.routes gespiegelt)
+        sqlx::query(
+            "INSERT INTO models (id, provider_id, model_name, upstream_model) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(pid)
+        .bind(&no_route)
+        .bind(&no_route)
+        .execute(&pg)
+        .await
+        .unwrap();
+
+        // self -> 400
+        assert_eq!(create_call(&state, &headers, &a, &a).await.status(), StatusCode::BAD_REQUEST);
+        // unbekanntes Quellmodell -> 400
+        assert_eq!(
+            create_call(&state, &headers, &format!("red-unknown-{suffix}"), &b)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        // Ziel ohne aktive Route -> 400
+        assert_eq!(create_call(&state, &headers, &a, &no_route).await.status(), StatusCode::BAD_REQUEST);
+
+        // Kette: g ist bereits Redirect-Quelle (g -> h), f -> g ist verboten
+        sqlx::query(
+            "INSERT INTO redirects (id, model_name, redirect_model_name) VALUES ($1, $2, $3)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&g)
+        .bind(&h)
+        .execute(&pg)
+        .await
+        .unwrap();
+        assert_eq!(create_call(&state, &headers, &f, &g).await.status(), StatusCode::BAD_REQUEST);
+
+        // Zyklus ueber Fallbacks: e hat aktives Fallback d, d -> e ist verboten
+        sqlx::query(
+            "INSERT INTO fallbacks (id, model_name, fallback_model_name, enabled) VALUES ($1, $2, $3, true)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&e)
+        .bind(&d)
+        .execute(&pg)
+        .await
+        .unwrap();
+        assert_eq!(create_call(&state, &headers, &d, &e).await.status(), StatusCode::BAD_REQUEST);
+
+        // sanity: gueltiger Redirect (a -> b) geht
+        assert_eq!(create_call(&state, &headers, &a, &b).await.status(), StatusCode::OK);
+
+        // cleanup (Provider cascaded Models; Redirect-Zeilen haben kein FK)
+        let _ = sqlx::query("DELETE FROM providers WHERE id = $1")
+            .bind(pid)
+            .execute(&pg)
+            .await;
+        let _ = sqlx::query("DELETE FROM redirects WHERE model_name IN ($1, $2)")
+            .bind(&g)
+            .bind(&a)
+            .execute(&pg)
+            .await;
     }
 }
 
