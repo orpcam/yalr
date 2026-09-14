@@ -20,8 +20,8 @@ export default function Providers() {
       <h1 className="text-2xl font-bold">{t("nav_providers")}</h1>
       <ProvidersSection providers={providers} refresh={load} />
       <ModelsSection providers={providers} models={models} refresh={load} />
-      <FallbacksSection fallbacks={fallbacks} modelNames={modelNames} refresh={load} />
       <RedirectsSection redirects={redirects} modelNames={modelNames} refresh={load} />
+      <FallbacksSection fallbacks={fallbacks} modelNames={modelNames} refresh={load} />
     </div>
   );
 }
