@@ -11,6 +11,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(proxy::proxy))
         .route("/v1/embeddings", post(proxy::proxy))
         .route("/v1/messages", post(proxy::proxy))
+        .route("/v1/audio/speech", post(proxy::proxy))
         .route("/v1/models", get(proxy::models_list));
 
     Router::new()

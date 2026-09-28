@@ -5,7 +5,8 @@ YALR is a self-hosted LLM gateway (similar to Helicone/LiteLLM) written in Rust:
 ## Features
 
 - **Unified API**: OpenAI-compatible endpoints (`/v1/chat/completions`,
-  `/v1/embeddings`, `/v1/models`) plus the native Anthropic format (`/v1/messages`)
+  `/v1/embeddings`, `/v1/audio/speech`, `/v1/models`) plus the native Anthropic
+  format (`/v1/messages`)
 - **Providers**: OpenAI, Anthropic, Google Gemini, and any OpenAI-compatible
   service (Ollama, Groq, DeepSeek, Mistral, Together, vLLM, ...) — including
   transparent format translation in both directions
@@ -77,6 +78,7 @@ virtual key as the API key.
 | `POST /v1/chat/completions` | OpenAI format (streaming + non-streaming) |
 | `POST /v1/messages` | Native Anthropic format (passthrough to Anthropic) |
 | `POST /v1/embeddings` | Embeddings (OpenAI-compatible providers) |
+| `POST /v1/audio/speech` | Text-to-speech (OpenAI-compatible providers). The audio is passed through unchanged with its content type; the request log stores only type and size |
 | `GET /v1/models` | Available (mapped) models |
 | `GET /health` | Healthcheck (liveness) |
 

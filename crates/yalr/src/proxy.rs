@@ -18,6 +18,8 @@ use ingest::{LiveEvent, LiveLog, RequestLog};
 use providers::{compute_cost, estimate_tokens, ProviderError, ProviderKind, RouteTarget};
 
 const MAX_RETRIES: usize = 2;
+/// Text-to-Speech: Anfrage als JSON wie beim Chat, Antwort ist Audio.
+const AUDIO_SPEECH: &str = "/v1/audio/speech";
 const RETRY_DELAY: Duration = Duration::from_millis(300);
 
 pub struct ProxyOutcome {
@@ -145,7 +147,7 @@ fn scoped_route_entries<'a>(
         .collect()
 }
 
-/// Behandelt `/v1/chat/completions`, `/v1/embeddings`, `/v1/messages` und `/v1/models`.
+/// Behandelt `/v1/chat/completions`, `/v1/embeddings`, `/v1/messages`, `/v1/audio/speech` und `/v1/models`.
 pub async fn proxy(
     State(state): State<AppState>,
     request: axum::extract::Request,
@@ -360,6 +362,18 @@ async fn execute_once(
     native_anthropic: bool,
     routing: &RoutingInfo,
 ) -> Result<ProxyOutcome, ProviderError> {
+    // Audio gibt es nur bei OpenAI-kompatiblen Providern; alles andere würde
+    // unten stillschweigend als Chat übersetzt.
+    if endpoint == AUDIO_SPEECH && !matches!(target.provider_kind, ProviderKind::OpenAi | ProviderKind::OpenAiCompat) {
+        return Err(ProviderError::Status {
+            status: 400,
+            body: format!(
+                "{AUDIO_SPEECH} is only supported by OpenAI-compatible providers (provider '{}' is {})",
+                target.provider_name,
+                target.provider_kind.as_str()
+            ),
+        });
+    }
     match target.provider_kind {
         ProviderKind::OpenAi | ProviderKind::OpenAiCompat => {
             openai_call(state, target, vk, endpoint, req_json, request_id, wants_stream, routing).await
@@ -387,6 +401,9 @@ async fn openai_call(
     wants_stream: bool,
     routing: &RoutingInfo,
 ) -> Result<ProxyOutcome, ProviderError> {
+    if endpoint == AUDIO_SPEECH {
+        return openai_audio_call(state, target, endpoint, req_json, routing).await;
+    }
     let mut body = req_json.clone();
     if wants_stream {
         body["stream"] = json!(true);
@@ -442,6 +459,67 @@ async fn openai_call(
             ),
         })
     }
+}
+
+/// Text-to-Speech (`/v1/audio/speech`). Die Anfrage geht wie beim Chat als
+/// JSON hinaus (Modellname auf das Upstream-Modell umgeschrieben), die Antwort
+/// ist aber Audio: Die Bytes gehen unverändert mit ihrem Content-Type zurück,
+/// ins Log kommt statt der Datei nur Typ und Größe. Tokens und Kosten sind 0.
+async fn openai_audio_call(
+    state: &AppState,
+    target: &RouteTarget,
+    endpoint: &str,
+    req_json: &Value,
+    routing: &RoutingInfo,
+) -> Result<ProxyOutcome, ProviderError> {
+    let mut upstream_body = req_json.clone();
+    if let Some(o) = upstream_body.as_object_mut() {
+        o.remove("stream");
+        o.remove("stream_options");
+    }
+    upstream_body["model"] = json!(target.upstream_model);
+
+    let url = providers::openai::OpenAiAdapter::endpoint_url(&target.base_url, endpoint);
+    let resp = state
+        .http
+        .post(&url)
+        .bearer_auth(&target.api_key)
+        .json(&upstream_body)
+        .send()
+        .await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(ProviderError::Status { status: status.as_u16(), body: text });
+    }
+    let content_type = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("audio/mpeg")
+        .to_string();
+    let audio = resp.bytes().await?;
+
+    let summary = audio_log_summary(&content_type, audio.len());
+    Ok(ProxyOutcome {
+        response: audio_response(&content_type, audio),
+        log: build_log_from_response(state, target, routing, endpoint, req_json, StatusCode::OK, &summary, 0, 0, false, ""),
+    })
+}
+
+/// Antwort mit den Audio-Bytes des Providers, unverändert.
+fn audio_response(content_type: &str, audio: bytes::Bytes) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", content_type)
+        .body(Body::from(audio))
+        .unwrap()
+}
+
+/// Was von einer Audio-Antwort ins Log kommt: Typ und Größe, nicht die Datei.
+fn audio_log_summary(content_type: &str, len: usize) -> Value {
+    json!({ "content_type": content_type, "bytes": len })
 }
 
 async fn anthropic_call(
@@ -1862,6 +1940,22 @@ pub async fn models_list(State(state): State<AppState>, headers: HeaderMap) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_audio_response_passes_bytes_and_type_through() {
+        let audio = bytes::Bytes::from_static(&[0xff, 0xf3, 0x44, 0xc4, 0x00]);
+        let resp = audio_response("audio/mpeg", audio.clone());
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "audio/mpeg");
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(body, audio, "Audio darf nicht als JSON angefasst werden");
+    }
+
+    #[test]
+    fn test_audio_log_summary_has_type_and_size_not_payload() {
+        let summary = audio_log_summary("audio/wav", 48_000);
+        assert_eq!(summary, json!({ "content_type": "audio/wav", "bytes": 48_000 }));
+    }
 
     #[test]
     fn test_apply_target_scope_and_combination() {
