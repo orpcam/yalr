@@ -402,7 +402,7 @@ async fn openai_call(
     routing: &RoutingInfo,
 ) -> Result<ProxyOutcome, ProviderError> {
     if endpoint == AUDIO_SPEECH {
-        return openai_audio_call(state, target, endpoint, req_json, routing).await;
+        return openai_audio_call(state, target, vk, endpoint, req_json, request_id, routing).await;
     }
     let mut body = req_json.clone();
     if wants_stream {
@@ -463,13 +463,18 @@ async fn openai_call(
 
 /// Text-to-Speech (`/v1/audio/speech`). Die Anfrage geht wie beim Chat als
 /// JSON hinaus (Modellname auf das Upstream-Modell umgeschrieben), die Antwort
-/// ist aber Audio: Die Bytes gehen unverändert mit ihrem Content-Type zurück,
-/// ins Log kommt statt der Datei nur Typ und Größe. Tokens und Kosten sind 0.
+/// ist aber Audio. Sie wird immer Stück für Stück durchgereicht – so kommt ein
+/// gestreamtes TTS (`"stream_format": "audio"`) ohne Verzögerung beim Client an,
+/// und eine Antwort am Stück ändert sich dadurch nicht. Ins Log kommen statt
+/// der Datei nur Typ und Größe, geschrieben, wenn der Strom zu Ende ist.
+#[allow(clippy::too_many_arguments)]
 async fn openai_audio_call(
     state: &AppState,
     target: &RouteTarget,
+    vk: &common::state::VirtualKey,
     endpoint: &str,
     req_json: &Value,
+    request_id: &str,
     routing: &RoutingInfo,
 ) -> Result<ProxyOutcome, ProviderError> {
     let mut upstream_body = req_json.clone();
@@ -480,6 +485,7 @@ async fn openai_audio_call(
     upstream_body["model"] = json!(target.upstream_model);
 
     let url = providers::openai::OpenAiAdapter::endpoint_url(&target.base_url, endpoint);
+    let started = Instant::now();
     let resp = state
         .http
         .post(&url)
@@ -499,22 +505,139 @@ async fn openai_audio_call(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("audio/mpeg")
         .to_string();
-    let audio = resp.bytes().await?;
 
-    let summary = audio_log_summary(&content_type, audio.len());
+    let stats = Arc::new(AudioStreamStats::default());
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let live_sink = state.log_sink.clone();
+    let rid = request_id.to_string();
+    let body = Body::from_stream(count_audio_stream(resp.bytes_stream(), stats.clone(), started, done_tx, move |ms| {
+        live_sink.emit(LiveEvent::FirstByte { request_id: rid.clone(), first_byte_ms: ms });
+    }));
+
+    // Protokoll, sobald der Strom zu Ende ist (oder der Client aufgelegt hat).
+    let (log_state, log_target, log_routing, log_vk) = (state.clone(), target.clone(), routing.clone(), vk.clone());
+    let (log_rid, log_endpoint, log_req, log_type) = (request_id.to_string(), endpoint.to_string(), req_json.clone(), content_type.clone());
+    tokio::spawn(async move {
+        let _ = done_rx.await;
+        let log = audio_stream_log(
+            &log_target, &log_routing, &log_vk, &log_rid, &log_endpoint, &log_req, &log_type,
+            stats.bytes.load(std::sync::atomic::Ordering::Relaxed),
+            started.elapsed().as_millis() as u64,
+            stats.first_byte_ms.lock().unwrap().unwrap_or(0),
+            stats.transport_error.lock().unwrap().clone(),
+        );
+        log_state.log_sink.log(log);
+    });
+
     Ok(ProxyOutcome {
-        response: audio_response(&content_type, audio),
-        log: build_log_from_response(state, target, routing, endpoint, req_json, StatusCode::OK, &summary, 0, 0, false, ""),
+        response: Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", content_type)
+            .body(body)
+            .unwrap(),
+        // is_stream + status 0: proxy() protokolliert nicht selbst (siehe oben)
+        log: empty_log(state, target, endpoint, req_json),
     })
 }
 
-/// Antwort mit den Audio-Bytes des Providers, unverändert.
-fn audio_response(content_type: &str, audio: bytes::Bytes) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", content_type)
-        .body(Body::from(audio))
-        .unwrap()
+/// Zähler einer durchgereichten Audio-Antwort – für das Protokoll am Ende.
+#[derive(Default)]
+struct AudioStreamStats {
+    bytes: std::sync::atomic::AtomicUsize,
+    first_byte_ms: std::sync::Mutex<Option<u64>>,
+    transport_error: std::sync::Mutex<Option<String>>,
+}
+
+/// Reicht die Audio-Stücke unverändert durch und zählt mit. Bricht der Provider
+/// mitten im Strom ab, bekommt der Client ein leeres Stück, der Fehler geht ins
+/// Protokoll. `done` lebt so lange wie der Strom; fällt er weg (fertig oder
+/// Client weg), weckt das den Protokoll-Task.
+fn count_audio_stream<S, E, F>(
+    upstream: S,
+    stats: Arc<AudioStreamStats>,
+    started: Instant,
+    done: tokio::sync::oneshot::Sender<()>,
+    on_first_byte: F,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+    E: std::fmt::Display,
+    F: Fn(u64) + Send + 'static,
+{
+    upstream.map(move |chunk| {
+        let _ = &done;
+        match chunk {
+            Ok(c) => {
+                if !c.is_empty() {
+                    let mut fb = stats.first_byte_ms.lock().unwrap();
+                    if fb.is_none() {
+                        let ms = started.elapsed().as_millis() as u64;
+                        *fb = Some(ms);
+                        on_first_byte(ms);
+                    }
+                    stats.bytes.fetch_add(c.len(), std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(c)
+            }
+            Err(e) => {
+                *stats.transport_error.lock().unwrap() = Some(e.to_string());
+                Ok(bytes::Bytes::new())
+            }
+        }
+    })
+}
+
+/// Protokolleintrag einer gestreamten Audio-Antwort: Typ und Größe statt der
+/// Datei, keine Tokens, keine Kosten. Ein Abbruch des Providers zählt als 502.
+#[allow(clippy::too_many_arguments)]
+fn audio_stream_log(
+    target: &RouteTarget,
+    routing: &RoutingInfo,
+    vk: &common::state::VirtualKey,
+    request_id: &str,
+    endpoint: &str,
+    req_json: &Value,
+    content_type: &str,
+    bytes: usize,
+    duration_ms: u64,
+    first_byte_ms: u64,
+    transport_error: Option<String>,
+) -> RequestLog {
+    let (status, error_type, error_message) = match transport_error {
+        Some(e) => (502, "provider_network".to_string(), e),
+        None => (200, String::new(), String::new()),
+    };
+    RequestLog {
+        id: Uuid::new_v4(),
+        request_id: request_id.to_string(),
+        timestamp: chrono::Utc::now(),
+        virtual_key_id: Some(vk.id),
+        key_name: vk.name.clone(),
+        provider: target.provider_kind.as_str().to_string(),
+        provider_name: target.provider_name.clone(),
+        provider_id: Some(target.provider_id),
+        model: target.model_name.clone(),
+        upstream_model: target.upstream_model.clone(),
+        endpoint: endpoint.to_string(),
+        status,
+        error_message,
+        error_type,
+        is_stream: true,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+        cost_usd: 0.0,
+        duration_ms,
+        first_byte_ms,
+        request_body: req_json.to_string(),
+        response_body: audio_log_summary(content_type, bytes).to_string(),
+        request_truncated: false,
+        response_truncated: false,
+        is_fallback: routing.fallback_used(&target.model_name),
+        is_redirect: routing.is_redirect,
+        original_model: routing.requested_model.clone(),
+        attempts_made: 1,
+    }
 }
 
 /// Was von einer Audio-Antwort ins Log kommt: Typ und Größe, nicht die Datei.
@@ -1942,13 +2065,57 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_audio_response_passes_bytes_and_type_through() {
-        let audio = bytes::Bytes::from_static(&[0xff, 0xf3, 0x44, 0xc4, 0x00]);
-        let resp = audio_response("audio/mpeg", audio.clone());
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers()["content-type"], "audio/mpeg");
-        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert_eq!(body, audio, "Audio darf nicht als JSON angefasst werden");
+    async fn test_count_audio_stream_passes_chunks_and_counts() {
+        let stats = Arc::new(AudioStreamStats::default());
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+        let erste = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let merk = erste.clone();
+        let quelle = futures::stream::iter(vec![
+            Ok::<_, String>(bytes::Bytes::from_static(&[0xff, 0xf3, 0x44])),
+            Ok(bytes::Bytes::new()),
+            Ok(bytes::Bytes::from_static(&[1, 2, 3, 4])),
+        ]);
+        let strom = count_audio_stream(quelle, stats.clone(), Instant::now(), done_tx, move |ms| merk.lock().unwrap().push(ms));
+        assert!(done_rx.try_recv().is_err(), "solange der Strom lebt, kein Protokoll");
+        let stuecke: Vec<bytes::Bytes> = strom.map(|c| c.unwrap()).collect().await;
+        assert_eq!(stuecke.concat(), vec![0xff, 0xf3, 0x44, 1, 2, 3, 4], "Audio unverändert");
+        assert_eq!(stats.bytes.load(std::sync::atomic::Ordering::Relaxed), 7);
+        assert_eq!(erste.lock().unwrap().len(), 1, "erstes Byte genau einmal melden");
+        assert!(stats.transport_error.lock().unwrap().is_none());
+        assert!(done_rx.await.is_err(), "Strom zu Ende → Protokoll-Task wacht auf");
+    }
+
+    #[tokio::test]
+    async fn test_count_audio_stream_upstream_abort_goes_to_log_not_client() {
+        let stats = Arc::new(AudioStreamStats::default());
+        let (done_tx, _done_rx) = tokio::sync::oneshot::channel::<()>();
+        let quelle = futures::stream::iter(vec![
+            Ok::<_, String>(bytes::Bytes::from_static(&[9, 9])),
+            Err("connection reset".to_string()),
+        ]);
+        let stuecke: Vec<_> = count_audio_stream(quelle, stats.clone(), Instant::now(), done_tx, |_| {}).collect().await;
+        assert!(stuecke.iter().all(|c| c.is_ok()), "der Client bekommt keinen Fehler mitten im Audio");
+        assert_eq!(stats.transport_error.lock().unwrap().as_deref(), Some("connection reset"));
+    }
+
+    #[test]
+    fn test_audio_stream_log_summarizes_without_payload() {
+        let target = scope_target(Uuid::new_v4(), "terra-ai-voice-v1");
+        let routing = RoutingInfo::new("terra-ai-voice-v1".into(), "terra-ai-voice-v1".into());
+        let vk = common::state::VirtualKey {
+            id: Uuid::new_v4(),
+            name: "terra".into(),
+            key_hash: String::new(),
+            budget_cents: None,
+            enabled: true,
+            allowed_providers: vec![],
+            allowed_models: vec![],
+        };
+        let ok = audio_stream_log(&target, &routing, &vk, "r1", AUDIO_SPEECH, &json!({"input": "Hallo"}), "audio/mpeg", 107_328, 9_400, 480, None);
+        assert_eq!((ok.status, ok.is_stream, ok.cost_usd, ok.first_byte_ms), (200, true, 0.0, 480));
+        assert_eq!(ok.response_body, json!({ "content_type": "audio/mpeg", "bytes": 107_328 }).to_string());
+        let kaputt = audio_stream_log(&target, &routing, &vk, "r2", AUDIO_SPEECH, &json!({}), "audio/mpeg", 10, 50, 5, Some("reset".into()));
+        assert_eq!((kaputt.status, kaputt.error_type.as_str()), (502, "provider_network"));
     }
 
     #[test]

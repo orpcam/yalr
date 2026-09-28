@@ -78,7 +78,7 @@ virtual key as the API key.
 | `POST /v1/chat/completions` | OpenAI format (streaming + non-streaming) |
 | `POST /v1/messages` | Native Anthropic format (passthrough to Anthropic) |
 | `POST /v1/embeddings` | Embeddings (OpenAI-compatible providers) |
-| `POST /v1/audio/speech` | Text-to-speech (OpenAI-compatible providers). The audio is passed through unchanged with its content type; the request log stores only type and size |
+| `POST /v1/audio/speech` | Text-to-speech (OpenAI-compatible providers). The audio is streamed through chunk by chunk, unchanged, with its content type — so `"stream_format": "audio"` reaches the client without delay; the request log stores only type, size and first-byte time |
 | `GET /v1/models` | Available (mapped) models |
 | `GET /health` | Healthcheck (liveness) |
 
