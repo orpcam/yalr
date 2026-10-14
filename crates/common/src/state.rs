@@ -35,6 +35,12 @@ pub struct MetricsSnapshot {
     pub clickhouse_up: Option<bool>,
 }
 
+/// Feste ID des synthetischen Keys, mit dem der Dashboard-Playground Requests
+/// durch die Proxy-Pipeline schickt (kein DB-Eintrag; in Logs erkennbar).
+pub const PLAYGROUND_KEY_ID: Uuid = Uuid::from_u128(0x706c6179_6772_6f75_6e64_000000000001);
+/// Name des Playground-Keys; fuer echte Keys reserviert.
+pub const PLAYGROUND_KEY_NAME: &str = "playground";
+
 /// Ein Virtual Key (aus Postgres, gecached).
 #[derive(Debug, Clone)]
 pub struct VirtualKey {

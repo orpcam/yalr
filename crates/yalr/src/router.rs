@@ -3,7 +3,7 @@
 use axum::routing::{get, post};
 use axum::Router;
 
-use crate::proxy;
+use crate::{playground, proxy};
 use common::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
@@ -12,7 +12,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/embeddings", post(proxy::proxy))
         .route("/v1/messages", post(proxy::proxy))
         .route("/v1/audio/speech", post(proxy::proxy))
-        .route("/v1/models", get(proxy::models_list));
+        .route("/v1/models", get(proxy::models_list))
+        // Dashboard-Playground (Session statt API-Key); Body wird im Handler
+        // roh gelesen (10 MB), keine Extractor-Grenze.
+        .route("/dashboard-api/playground/chat", post(playground::chat))
+        .route("/dashboard-api/playground/speech", post(playground::speech));
 
     Router::new()
         .merge(proxy_routes)

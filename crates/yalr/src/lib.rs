@@ -1,4 +1,5 @@
 pub mod config;
+pub mod playground;
 pub mod proxy;
 pub mod router;
 

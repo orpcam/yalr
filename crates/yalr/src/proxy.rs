@@ -147,6 +147,19 @@ fn scoped_route_entries<'a>(
         .collect()
 }
 
+/// Maximale Request-Body-Groesse fuer /v1 und den Playground.
+pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// `x-llm-provider`-Header (getrimmt); leer oder nicht-UTF-8 = kein Override.
+pub fn provider_override(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-llm-provider")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Behandelt `/v1/chat/completions`, `/v1/embeddings`, `/v1/messages`, `/v1/audio/speech` und `/v1/models`.
 pub async fn proxy(
     State(state): State<AppState>,
@@ -155,7 +168,7 @@ pub async fn proxy(
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
     let endpoint = endpoint_from_uri(&parts.uri);
-    let body = axum::body::to_bytes(body, 10 * 1024 * 1024)
+    let body = axum::body::to_bytes(body, MAX_BODY_BYTES)
         .await
         .unwrap_or_default();
     let started = Instant::now();
@@ -169,11 +182,104 @@ pub async fn proxy(
         }
     };
 
+    // Provider-Override (hybrid: header-override gewinnt, sonst model-name)
+    let provider_override = provider_override(&headers);
+
+    proxy_core(
+        &state,
+        vk,
+        endpoint,
+        body,
+        request_id,
+        started,
+        CoreOpts { provider_override, expose_routing: false },
+    )
+    .await
+}
+
+/// Optionen fuer `proxy_core` (unterscheiden /v1 vom Dashboard-Playground).
+#[derive(Debug, Clone, Default)]
+pub struct CoreOpts {
+    /// Wert des `x-llm-provider`-Headers (nur Targets dieses Providers).
+    pub provider_override: Option<String>,
+    /// true: Routing-Metadaten als `x-yalr-*`-Response-Header anhaengen.
+    pub expose_routing: bool,
+}
+
+/// Was die Pipeline ueber den bedienenden Target weiss (fuer `x-yalr-*`).
+#[derive(Debug, Default)]
+struct ServedMeta {
+    provider_name: Option<String>,
+    model_name: Option<String>,
+    upstream_model: Option<String>,
+    fallback: Option<bool>,
+    attempts: Option<u8>,
+}
+
+/// Haengt die Routing-Header an (nur bei `CoreOpts::expose_routing`).
+fn apply_routing_headers(resp: &mut Response, request_id: &str, meta: &ServedMeta) {
+    use axum::http::HeaderValue;
+    let h = resp.headers_mut();
+    let mut put = |name: &'static str, value: &str| {
+        if let Ok(v) = HeaderValue::from_str(value) {
+            h.insert(name, v);
+        }
+    };
+    put("x-yalr-request-id", request_id);
+    if let Some(v) = &meta.provider_name {
+        put("x-yalr-provider", v);
+    }
+    if let Some(v) = &meta.model_name {
+        put("x-yalr-model", v);
+    }
+    if let Some(v) = &meta.upstream_model {
+        put("x-yalr-upstream-model", v);
+    }
+    if let Some(f) = meta.fallback {
+        put("x-yalr-fallback", if f { "1" } else { "0" });
+    }
+    if let Some(n) = meta.attempts {
+        put("x-yalr-attempts", &n.to_string());
+    }
+}
+
+/// Proxy-Pipeline ab dem authentifizierten Key: parse, Scope, Routing,
+/// Fallback-Schleife, Logging. Von `/v1/*` und vom Dashboard-Playground
+/// genutzt.
+pub async fn proxy_core(
+    state: &AppState,
+    vk: common::state::VirtualKey,
+    endpoint: String,
+    body: bytes::Bytes,
+    request_id: String,
+    started: Instant,
+    opts: CoreOpts,
+) -> Response {
+    let mut meta = ServedMeta::default();
+    let rid = request_id.clone();
+    let mut resp = proxy_pipeline(state, vk, endpoint, body, request_id, started, opts.provider_override, &mut meta).await;
+    if opts.expose_routing {
+        apply_routing_headers(&mut resp, &rid, &meta);
+    }
+    resp
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_pipeline(
+    state: &AppState,
+    vk: common::state::VirtualKey,
+    endpoint: String,
+    body: bytes::Bytes,
+    request_id: String,
+    started: Instant,
+    provider_override: Option<String>,
+    meta: &mut ServedMeta,
+) -> Response {
     // 2) Request-Body parsen (model etc.)
     let req_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            return error_response(state, None, Some(&vk), &request_id, &endpoint, started, StatusCode::BAD_REQUEST, "invalid_json", &e.to_string(), 0, &body).await;
+            return error_response(state.clone(), None, Some(&vk), &request_id, &endpoint, started, StatusCode::BAD_REQUEST, "invalid_json", &e.to_string(), 0, &body).await;
         }
     };
 
@@ -184,22 +290,17 @@ pub async fn proxy(
         .to_string();
 
     if requested_model.is_empty() {
-        return error_response(state, None, Some(&vk), &request_id, &endpoint, started, StatusCode::BAD_REQUEST, "missing_model", "request body has no 'model' field", 0, &body).await;
+        return error_response(state.clone(), None, Some(&vk), &request_id, &endpoint, started, StatusCode::BAD_REQUEST, "missing_model", "request body has no 'model' field", 0, &body).await;
     }
 
     // 2b) Key-Scope: Modell-Check auf den angeforderten Namen, VOR dem
     //     Routing (s. model_scope_denied: kein Konfig-Leak, deterministisch)
     if model_scope_denied(&vk.allowed_models, &requested_model) {
         let msg = format!("model '{requested_model}' is not allowed for this key");
-        return error_response(state, None, Some(&vk), &request_id, &endpoint, started, StatusCode::FORBIDDEN, "model_not_allowed", &msg, 0, &body).await;
+        return error_response(state.clone(), None, Some(&vk), &request_id, &endpoint, started, StatusCode::FORBIDDEN, "model_not_allowed", &msg, 0, &body).await;
     }
 
     // 3) Route aufloesen (hybrid: header-override gewinnt, sonst model-name)
-    let provider_override = headers
-        .get("x-llm-provider")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
     let resolved = state.resolve_route(&requested_model).await;
     // Routing-Kontext einMALIG hier berechnen und durch den Call-Stack reichen
     // (s. RoutingInfo): is_redirect/is_fallback wären zur Log-Zeit sonst nicht
@@ -211,7 +312,7 @@ pub async fn proxy(
         None => {
             // toter Redirect (503) schlägt fehlendem Modell (404) voraus
             let failure = resolve_failure(&routing, &requested_model);
-            return error_response(state, Some(&routing), Some(&vk), &request_id, &endpoint, started, failure.status, failure.error_type, &failure.message, 0, &body).await;
+            return error_response(state.clone(), Some(&routing), Some(&vk), &request_id, &endpoint, started, failure.status, failure.error_type, &failure.message, 0, &body).await;
         }
     };
 
@@ -229,7 +330,7 @@ pub async fn proxy(
             "provider_not_allowed" => format!("no provider allowed for this key serves model '{model_for_msg}'"),
             _ => format!("model '{model_for_msg}' is not allowed for this key"),
         };
-        return error_response(state, Some(&routing), Some(&vk), &request_id, &endpoint, started, StatusCode::FORBIDDEN, error_type, &msg, 0, &body).await;
+        return error_response(state.clone(), Some(&routing), Some(&vk), &request_id, &endpoint, started, StatusCode::FORBIDDEN, error_type, &msg, 0, &body).await;
     }
 
     // Provider-Override: nur targets des gewuenschten providers behalten
@@ -249,7 +350,7 @@ pub async fn proxy(
                 requested_model.clone()
             };
             let msg = format!("no enabled provider '{override_name}' for model '{model_for_msg}'");
-            return error_response(state, Some(&routing), Some(&vk), &request_id, &endpoint, started, StatusCode::NOT_FOUND, "unknown_provider", &msg, 0, &body).await;
+            return error_response(state.clone(), Some(&routing), Some(&vk), &request_id, &endpoint, started, StatusCode::NOT_FOUND, "unknown_provider", &msg, 0, &body).await;
         }
         tracing::debug!("provider override '{override_name}' reduced targets {before} -> {}", targets.len());
     }
@@ -292,8 +393,14 @@ pub async fn proxy(
     for (attempt, target) in targets.iter().enumerate() {
         attempts_made = attempts_made.saturating_add(1);
         let attempt_start = Instant::now();
-        match execute_once(&state, target, &vk, &endpoint, &req_json, &request_id, wants_stream, native_anthropic, &routing).await {
+        match execute_once(state, target, &vk, &endpoint, &req_json, &request_id, wants_stream, native_anthropic, &routing).await {
             Ok(outcome) => {
+                // bedienender Target (Index `attempt`) fuer x-yalr-*-Header
+                meta.provider_name = Some(target.provider_name.clone());
+                meta.model_name = Some(target.model_name.clone());
+                meta.upstream_model = Some(target.upstream_model.clone());
+                meta.fallback = Some(routing.fallback_used(&target.model_name));
+                meta.attempts = Some(attempts_made);
                 // streaming wird separat geloggt (log_stream_completion), sobald der
                 // stream fertig ist - hier nicht doppelt loggen
                 if outcome.log.is_stream && outcome.log.status == 0 {
@@ -302,7 +409,7 @@ pub async fn proxy(
                 // success: loggen und response zurueckgeben
                 let duration_ms = started.elapsed().as_millis() as u64;
                 let log = build_log(
-                    &state,
+                    state,
                     Some(&vk),
                     &request_id,
                     &endpoint,
@@ -346,7 +453,8 @@ pub async fn proxy(
     let error_type = if matches!(err, ProviderError::Network(_)) { "provider_network" } else { "provider_error" };
     // attempts_made: nur die tatsächlich ausgefuehrten Versuche (früher Abbruch
     // bei nicht-retryablem Fehler zahlt nicht alle Targets der Route)
-    error_response(state, Some(&routing), Some(&vk), &request_id, &endpoint, started, status, error_type, &err.to_string(), attempts_made.min(255), &body).await
+    meta.attempts = Some(attempts_made);
+    error_response(state.clone(), Some(&routing), Some(&vk), &request_id, &endpoint, started, status, error_type, &err.to_string(), attempts_made.min(255), &body).await
 }
 
 /// Ein einzelner Provider-Versuch.
@@ -629,7 +737,7 @@ fn audio_stream_log(
         cost_usd: 0.0,
         duration_ms,
         first_byte_ms,
-        request_body: req_json.to_string(),
+        request_body: redact_for_log(req_json),
         response_body: audio_log_summary(content_type, bytes).to_string(),
         request_truncated: false,
         response_truncated: false,
@@ -1382,7 +1490,7 @@ fn log_stream_completion(
             cost_usd: cost,
             duration_ms,
             first_byte_ms,
-            request_body: req_json.to_string(),
+            request_body: redact_for_log(&req_json),
             response_body,
             request_truncated: false,
             response_truncated: false,
@@ -1774,6 +1882,46 @@ fn rewrite_stream_chunk_model(chunk: &bytes::Bytes, model_name: &str) -> Option<
 // Log-Building
 // ============================================================
 
+/// Request-Body fuer das Log serialisieren, eingebettete Base64-Data-URLs
+/// (Bilder, Audio aus dem Playground o.ae.) durch einen Platzhalter ersetzt:
+/// `data:<mime>;base64,<N bytes omitted>` (N = Laenge des Base64-Teils).
+/// Base64-Data-URL? `data:`-Praefix ASCII-case-insensitiv (RFC 2397).
+fn is_data_url(s: &str) -> bool {
+    s.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:")) && s.contains(";base64,")
+}
+
+/// Enthaelt der JSON-Wert irgendwo eine Base64-Data-URL?
+fn has_data_url(v: &Value) -> bool {
+    match v {
+        Value::String(s) => is_data_url(s),
+        Value::Array(a) => a.iter().any(has_data_url),
+        Value::Object(o) => o.values().any(has_data_url),
+        _ => false,
+    }
+}
+
+fn redact_for_log(value: &Value) -> String {
+    fn redact(v: &mut Value) {
+        match v {
+            Value::String(s) if is_data_url(s) => {
+                let (head, payload) = s.split_once(";base64,").unwrap_or((s.as_str(), ""));
+                let mime = &head[5..];
+                *s = format!("data:{mime};base64,<{} bytes omitted>", payload.len());
+            }
+            Value::Array(a) => a.iter_mut().for_each(redact),
+            Value::Object(o) => o.values_mut().for_each(redact),
+            _ => {}
+        }
+    }
+    // Normalfall ohne Data-URL: kein Klon, Ausgabe identisch zu to_string().
+    if !has_data_url(value) {
+        return value.to_string();
+    }
+    let mut v = value.clone();
+    redact(&mut v);
+    v.to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_log(
     _state: &AppState,
@@ -1792,7 +1940,7 @@ fn build_log(
     let cost = compute_cost(p, c, target.input_price_per_million, target.output_price_per_million);
     let is_stream = outcome.log.is_stream;
     let status = outcome.log.status;
-    let request_body = req_json.to_string();
+    let request_body = redact_for_log(req_json);
     let response_body = outcome.log.response_body.clone();
     let error_message = outcome.log.error_message.clone();
     let error_type = outcome.log.error_type.clone();
@@ -1884,7 +2032,7 @@ fn build_log_from_response(
         cost_usd: cost,
         duration_ms: 0,
         first_byte_ms: 0,
-        request_body: req_json.to_string(),
+        request_body: redact_for_log(req_json),
         response_body: serde_json::to_string(resp_json).unwrap_or_default(),
         request_truncated: false,
         response_truncated: false,
@@ -1983,7 +2131,7 @@ async fn error_response(
         cost_usd: 0.0,
         duration_ms,
         first_byte_ms: 0,
-        request_body: String::from_utf8_lossy(req_body).to_string(),
+        request_body: error_log_body(req_body),
         response_body: String::new(),
         request_truncated: false,
         response_truncated: false,
@@ -2003,6 +2151,15 @@ async fn error_response(
         }
     });
     (status, axum::Json(body)).into_response()
+}
+
+/// Request-Body fuer Fehler-Logs: Roh-Bytes wie empfangen; nur wenn der Body
+/// JSON mit Data-URL ist, die redigierte Serialisierung.
+fn error_log_body(req_body: &[u8]) -> String {
+    match serde_json::from_slice::<Value>(req_body) {
+        Ok(v) if has_data_url(&v) => redact_for_log(&v),
+        _ => String::from_utf8_lossy(req_body).to_string(),
+    }
 }
 
 fn status_text(status: &StatusCode) -> String {
@@ -2634,5 +2791,311 @@ mod tests {
         let hit = scoped_route_entries(&routes, &[p1], &["A".into()]);
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].0, "A");
+    }
+}
+
+#[cfg(test)]
+mod playground_tests {
+    use super::*;
+    use axum::routing::post;
+
+    fn test_state() -> AppState {
+        // Lazy-Pools: werden in diesen Pfaden nie angefasst.
+        let pg = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://user:pass@127.0.0.1:1/none")
+            .unwrap();
+        let (sink, _h) = ingest::start(clickhouse::Client::default(), ingest::IngestConfig::default());
+        Arc::new(common::state::AppStateInner::new(
+            pg,
+            clickhouse::Client::default(),
+            reqwest::Client::new(),
+            sink,
+            "session-secret".into(),
+            "0".repeat(32),
+            Arc::new(tokio::sync::RwLock::new(common::state::MetricsSnapshot::default())),
+            None,
+        ))
+    }
+
+    /// Mock-Upstream: /ok/* antwortet mit einer Chat-Completion, /fail/* mit 500.
+    async fn mock_upstream() -> String {
+        let app = axum::Router::new()
+            .route(
+                "/ok/chat/completions",
+                post(|| async {
+                    axum::Json(json!({
+                        "id": "x", "object": "chat.completion", "model": "upstream",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    }))
+                }),
+            )
+            .route("/fail/chat/completions", post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }))
+            .route(
+                "/sse/chat/completions",
+                post(|| async {
+                    let chunk = json!({
+                        "id": "x", "object": "chat.completion.chunk", "model": "upstream",
+                        "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}]
+                    });
+                    (
+                        [("content-type", "text/event-stream")],
+                        format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn target(base: &str, provider: &str, model: &str, upstream: &str) -> RouteTarget {
+        RouteTarget {
+            provider_id: Uuid::new_v4(),
+            provider_name: provider.into(),
+            provider_kind: ProviderKind::OpenAi,
+            base_url: base.into(),
+            api_key: "k".into(),
+            model_name: model.into(),
+            upstream_model: upstream.into(),
+            input_price_per_million: 0.0,
+            output_price_per_million: 0.0,
+            capabilities: None,
+        }
+    }
+
+    fn json_request(body: impl Into<Body>) -> axum::extract::Request {
+        axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(body.into())
+            .unwrap()
+    }
+
+    fn hdr<'a>(r: &'a Response, name: &str) -> Option<&'a str> {
+        r.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    const CHAT_BODY: &str = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+
+    #[test]
+    fn test_redact_for_log() {
+        let v = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "data: not a url"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJDRA=="}}
+            ]}],
+            "input_audio": "data:audio/wav;base64,AAAA"
+        });
+        let out: Value = serde_json::from_str(&redact_for_log(&v)).unwrap();
+        assert_eq!(out["messages"][0]["content"][1]["image_url"]["url"], "data:image/png;base64,<8 bytes omitted>");
+        assert_eq!(out["input_audio"], "data:audio/wav;base64,<4 bytes omitted>");
+        assert_eq!(out["messages"][0]["content"][0]["text"], "data: not a url");
+        // ohne Data-URL: identisch zu to_string()
+        let plain = json!({"model": "m", "x": [1, "data:text/plain,hi"]});
+        assert_eq!(redact_for_log(&plain), plain.to_string());
+        // Praefix case-insensitiv
+        assert!(is_data_url("DATA:image/png;base64,AA") && is_data_url("Data:x;base64,"));
+        assert!(!is_data_url("dat") && !is_data_url("data:text/plain,hi") && !is_data_url("xdata:a;base64,"));
+        let upper = json!({"u": "DATA:image/png;base64,QUJD"});
+        let out: Value = serde_json::from_str(&redact_for_log(&upper)).unwrap();
+        assert_eq!(out["u"], "data:image/png;base64,<4 bytes omitted>");
+    }
+
+    #[test]
+    fn test_error_log_body_keeps_raw_bytes() {
+        // JSON ohne Data-URL: byte-identisch (Key-Reihenfolge, Whitespace)
+        let raw = b"{ \"z\": 1,\n  \"model\" : \"m\" }";
+        assert_eq!(error_log_body(raw).as_bytes(), raw);
+        // kein JSON: lossy wie bisher
+        assert_eq!(error_log_body(b"not json \xff"), "not json \u{fffd}");
+        // JSON mit Data-URL: redigiert
+        let out = error_log_body(br#"{"img": "data:image/png;base64,QUJD"}"#);
+        assert!(out.contains("<4 bytes omitted>") && !out.contains("QUJD"));
+    }
+
+    #[test]
+    fn test_provider_override_header() {
+        let mut h = HeaderMap::new();
+        assert_eq!(provider_override(&h), None);
+        h.insert("x-llm-provider", "".parse().unwrap());
+        assert_eq!(provider_override(&h), None);
+        h.insert("x-llm-provider", "   ".parse().unwrap());
+        assert_eq!(provider_override(&h), None);
+        h.insert("x-llm-provider", " prov-b ".parse().unwrap());
+        assert_eq!(provider_override(&h).as_deref(), Some("prov-b"));
+    }
+
+    #[tokio::test]
+    async fn test_playground_provider_override() {
+        let base = mock_upstream().await;
+        let state = test_state();
+        state.routes.write().await.insert(
+            "m".into(),
+            vec![
+                target(&format!("{base}/ok"), "prov-a", "m", "up-a"),
+                target(&format!("{base}/ok"), "prov-b", "m", "up-b"),
+            ],
+        );
+        let req = |provider: &str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .header("content-type", "application/json")
+                .header("x-llm-provider", provider)
+                .body(Body::from(CHAT_BODY))
+                .unwrap()
+        };
+        let resp = crate::playground::handle_for_test(&state, req("prov-b"), "/v1/chat/completions", Ok(())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hdr(&resp, "x-yalr-provider"), Some("prov-b"));
+        assert_eq!(hdr(&resp, "x-yalr-upstream-model"), Some("up-b"));
+        // leerer Header = kein Override -> primaerer Target
+        let resp = crate::playground::handle_for_test(&state, req(""), "/v1/chat/completions", Ok(())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hdr(&resp, "x-yalr-provider"), Some("prov-a"));
+    }
+
+    #[tokio::test]
+    async fn test_playground_stream_exposes_routing_headers() {
+        let base = mock_upstream().await;
+        let state = test_state();
+        state.routes.write().await.insert("m".into(), vec![target(&format!("{base}/sse"), "prov-s", "m", "up-s")]);
+        let body = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = crate::playground::handle_for_test(&state, json_request(body), "/v1/chat/completions", Ok(())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(hdr(&resp, "content-type").is_some_and(|v| v.starts_with("text/event-stream")));
+        assert!(hdr(&resp, "x-yalr-request-id").is_some_and(|v| !v.is_empty()));
+        assert_eq!(hdr(&resp, "x-yalr-provider"), Some("prov-s"));
+        assert_eq!(hdr(&resp, "x-yalr-model"), Some("m"));
+        assert_eq!(hdr(&resp, "x-yalr-upstream-model"), Some("up-s"));
+        assert_eq!(hdr(&resp, "x-yalr-fallback"), Some("0"));
+        assert_eq!(hdr(&resp, "x-yalr-attempts"), Some("1"));
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("\"hi\""), "stream body: {text}");
+    }
+
+    #[tokio::test]
+    async fn test_playground_success_exposes_routing_headers() {
+        let base = mock_upstream().await;
+        let state = test_state();
+        state.routes.write().await.insert("m".into(), vec![target(&format!("{base}/ok"), "prov-a", "m", "up-m")]);
+        let resp = crate::playground::handle_for_test(&state, json_request(CHAT_BODY), "/v1/chat/completions", Ok(())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(hdr(&resp, "x-yalr-request-id").is_some_and(|v| !v.is_empty()));
+        assert_eq!(hdr(&resp, "x-yalr-provider"), Some("prov-a"));
+        assert_eq!(hdr(&resp, "x-yalr-model"), Some("m"));
+        assert_eq!(hdr(&resp, "x-yalr-upstream-model"), Some("up-m"));
+        assert_eq!(hdr(&resp, "x-yalr-fallback"), Some("0"));
+        assert_eq!(hdr(&resp, "x-yalr-attempts"), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn test_v1_core_has_no_routing_headers() {
+        let base = mock_upstream().await;
+        let state = test_state();
+        state.routes.write().await.insert("m".into(), vec![target(&format!("{base}/ok"), "prov-a", "m", "up-m")]);
+        let resp = proxy_core(
+            &state,
+            crate::playground::playground_key(),
+            "/v1/chat/completions".into(),
+            bytes::Bytes::from_static(CHAT_BODY.as_bytes()),
+            Uuid::new_v4().to_string(),
+            Instant::now(),
+            CoreOpts::default(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().keys().all(|k| !k.as_str().starts_with("x-yalr-")));
+        // auch im Fehlerfall nicht
+        let resp = proxy_core(
+            &state,
+            crate::playground::playground_key(),
+            "/v1/chat/completions".into(),
+            bytes::Bytes::from_static(br#"{"model":"nope"}"#),
+            Uuid::new_v4().to_string(),
+            Instant::now(),
+            CoreOpts::default(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(resp.headers().keys().all(|k| !k.as_str().starts_with("x-yalr-")));
+    }
+
+    #[tokio::test]
+    async fn test_playground_fallback_headers_after_primary_failure() {
+        let base = mock_upstream().await;
+        let state = test_state();
+        state.routes.write().await.insert(
+            "m".into(),
+            vec![
+                target(&format!("{base}/fail"), "prov-a", "m", "up-m"),
+                target(&format!("{base}/ok"), "prov-b", "fb", "up-fb"),
+            ],
+        );
+        let resp = crate::playground::handle_for_test(&state, json_request(CHAT_BODY), "/v1/chat/completions", Ok(())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hdr(&resp, "x-yalr-provider"), Some("prov-b"));
+        assert_eq!(hdr(&resp, "x-yalr-model"), Some("fb"));
+        assert_eq!(hdr(&resp, "x-yalr-upstream-model"), Some("up-fb"));
+        assert_eq!(hdr(&resp, "x-yalr-fallback"), Some("1"));
+        assert_eq!(hdr(&resp, "x-yalr-attempts"), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn test_playground_error_headers() {
+        let base = mock_upstream().await;
+        let state = test_state();
+        // unbekanntes Modell: nur request-id
+        let resp = crate::playground::handle_for_test(&state, json_request(CHAT_BODY), "/v1/chat/completions", Ok(())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(hdr(&resp, "x-yalr-request-id").is_some());
+        assert!(hdr(&resp, "x-yalr-provider").is_none());
+        // alle Targets scheitern: request-id + attempts
+        state.routes.write().await.insert("m".into(), vec![target(&format!("{base}/fail"), "prov-a", "m", "up-m")]);
+        let resp = crate::playground::handle_for_test(&state, json_request(CHAT_BODY), "/v1/chat/completions", Ok(())).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(hdr(&resp, "x-yalr-request-id").is_some());
+        assert_eq!(hdr(&resp, "x-yalr-attempts"), Some("1"));
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "provider_error");
+    }
+
+    #[tokio::test]
+    async fn test_playground_guards() {
+        let state = test_state();
+        // 401 ohne Session (echter Handler: ohne Cookie kein DB-Zugriff)
+        let resp = crate::playground::chat(State(state.clone()), json_request(CHAT_BODY)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v, json!({"error": {"message": "unauthorized", "type": "auth"}}));
+        // 415 falscher Content-Type
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", "text/plain")
+            .body(Body::from(CHAT_BODY))
+            .unwrap();
+        let resp = crate::playground::handle_for_test(&state, req, "/v1/chat/completions", Ok(())).await;
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        // 403 cross-site
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::from(CHAT_BODY))
+            .unwrap();
+        let resp = crate::playground::handle_for_test(&state, req, "/v1/chat/completions", Ok(())).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // 413 > 10 MB
+        let big = vec![b' '; MAX_BODY_BYTES + 1];
+        let resp = crate::playground::handle_for_test(&state, json_request(big), "/v1/audio/speech", Ok(())).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "payload_too_large");
     }
 }

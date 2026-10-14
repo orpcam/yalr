@@ -23,6 +23,14 @@ YALR is a self-hosted LLM gateway (similar to Helicone/LiteLLM) written in Rust:
   model's own route; the target's fallback chains still apply
 - **Logging & Costs**: every request is logged asynchronously (without blocking
   the hot path) to ClickHouse, including token usage and costs; 90-day TTL
+- **Playground**: dashboard page to try models through the regular
+  routing pipeline (redirects, fallbacks, retries) — chat with optional
+  provider pin, sampling parameters, streaming, reasoning on/off + effort,
+  extra JSON fields and image upload; per answer TTFT, duration, tokens/s
+  and the serving provider/model with a link to the log entry. Speech tab
+  for TTS (play/download), raw tab with request/response and routing
+  headers. Runs under the built-in key `playground` (no budget/scopes,
+  name reserved), only via the dashboard session — not exposed on the edge
 - **Dashboard**: React UI with overview (KPIs, charts), request log with
   request/response details, key management, provider/model/fallback/redirect
   setup
@@ -42,6 +50,7 @@ Client ──► Gateway :8080 ──► OpenAI / Anthropic / Gemini / OpenAI-co
               ├─► Postgres   (keys, provider credentials, models, fallbacks, redirects, sessions)
               ├─► ClickHouse (request logs, batched via channel)
               └─► /dashboard-api + React UI (session cookie, bcrypt) — private
+                    (incl. Playground → proxy pipeline as key "playground")
 ```
 
 ## Quickstart
@@ -126,5 +135,6 @@ migrations/     # Postgres migrations
 - Provider API keys are stored encrypted in Postgres
   (XOR keystream; swap for an AEAD library if you need stronger guarantees)
 - Logs contain request/response bodies (max. 32 KB, configurable truncation) —
-  adjust the ingest pipeline if you deal with sensitive content
+  adjust the ingest pipeline if you deal with sensitive content; base64 data
+  URLs (e.g. images) are replaced by `data:<mime>;base64,<N bytes omitted>`
 - ClickHouse TTL: logs are automatically deleted after 90 days

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 tokio = { workspace = true }
 axum = { workspace = true }
+http-body-util = "0.1"
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

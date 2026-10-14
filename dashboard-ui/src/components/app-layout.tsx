@@ -22,6 +22,7 @@ const navItems: { to: string; labelKey: TranslationKey }[] = [
   { to: "/requests", labelKey: "nav_requests" },
   { to: "/keys", labelKey: "nav_keys" },
   { to: "/providers", labelKey: "nav_providers" },
+  { to: "/playground", labelKey: "nav_playground" },
   { to: "/settings", labelKey: "nav_settings" },
 ];
 

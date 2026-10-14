@@ -349,6 +349,19 @@ pub struct CreateKeyRequest {
     pub allowed_model_names: Option<Vec<String>>,
 }
 
+/// Fuer den synthetischen Playground-Key reserviert (s. common::state::PLAYGROUND_KEY_ID).
+fn is_reserved_key_name(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(common::state::PLAYGROUND_KEY_NAME)
+}
+
+fn reserved_name_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "name 'playground' is reserved"})),
+    )
+        .into_response()
+}
+
 pub async fn create_key(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -359,6 +372,9 @@ pub async fn create_key(
     }
     if req.name.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "name required"}))).into_response();
+    }
+    if is_reserved_key_name(&req.name) {
+        return reserved_name_response();
     }
 
     // Scope-Listen bereinigen und validieren (fehlende Provider/Modelle -> 400)
@@ -462,6 +478,9 @@ pub async fn update_key(
 ) -> Response {
     if auth::require_session(&state, &headers).await.is_err() {
         return unauthorized();
+    }
+    if req.name.as_deref().is_some_and(is_reserved_key_name) {
+        return reserved_name_response();
     }
 
     let existing = sqlx::query_as::<_, KeyRow>(
@@ -2379,10 +2398,15 @@ pub async fn get_log(
                    is_stream, prompt_tokens, completion_tokens, cost_usd,
                    duration_ms, first_byte_ms, request_body, response_body,
                    request_truncated, response_truncated
-            FROM yalr.request_logs WHERE id = ?
+            FROM yalr.request_logs WHERE id = ? OR request_id = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
             "#,
         )
         .bind(id)
+        // Playground verlinkt per `x-yalr-request-id` (bei Fallback mehrere
+        // Zeilen pro request_id) -> neueste Zeile.
+        .bind(id.to_string())
         .fetch_one::<LogDetailRow>()
         .await;
 
@@ -6052,3 +6076,18 @@ mod scope_clean_tests {
     }
 }
 
+
+#[cfg(test)]
+mod reserved_name_tests {
+    use super::*;
+
+    #[test]
+    fn test_playground_key_name_is_reserved() {
+        assert!(is_reserved_key_name("playground"));
+        assert!(is_reserved_key_name("PlayGround"));
+        assert!(is_reserved_key_name("  playground "));
+        assert!(!is_reserved_key_name("playground-2"));
+        assert!(!is_reserved_key_name("terra"));
+        assert_eq!(reserved_name_response().status(), StatusCode::BAD_REQUEST);
+    }
+}

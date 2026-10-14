@@ -3021,6 +3021,7 @@ dependencies = [
  "common",
  "dashboard",
  "futures",
+ "http-body-util",
  "include_dir",
  "ingest",
  "once_cell",

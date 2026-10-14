@@ -16,6 +16,7 @@ const RequestDetail = lazy(() => import("@/pages/RequestDetail"));
 const Keys = lazy(() => import("@/pages/Keys"));
 const Providers = lazy(() => import("@/pages/Providers"));
 const Settings = lazy(() => import("@/pages/Settings"));
+const Playground = lazy(() => import("@/pages/Playground"));
 
 // Remount-trigger: seiten laden ihre daten in useEffect - ein key auf dem
 // router-outlet erzwingt einen frischen load bei jedem seitenwechsel (z.b.
@@ -70,6 +71,14 @@ function FreshRoutes() {
           element={
             <Suspense fallback={null}>
               <Providers />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/playground"
+          element={
+            <Suspense fallback={null}>
+              <Playground />
             </Suspense>
           }
         />
