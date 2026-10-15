@@ -188,6 +188,7 @@ const en = {
   base_url: "Base URL",
   api_key: "API key",
   input_price: "Input $/1M",
+  input_price_hint: "Per 1M input tokens. For speech models (/v1/audio/speech): per 1M characters of text.",
   output_price: "Output $/1M",
   no_providers: "No providers configured.",
   confirm_delete_provider: 'Delete provider "{name}"? Associated models will be deleted as well.',
@@ -487,6 +488,7 @@ const de: Record<TranslationKey, string> = {
   base_url: "Base URL",
   api_key: "API-Key",
   input_price: "Input $/1M",
+  input_price_hint: "Pro 1 Mio. Input-Tokens. Bei Sprachmodellen (/v1/audio/speech): pro 1 Mio. Zeichen Text.",
   output_price: "Output $/1M",
   no_providers: "Noch keine Provider konfiguriert.",
   confirm_delete_provider:

@@ -651,7 +651,12 @@ async fn openai_audio_call(
             stats.first_byte_ms.lock().unwrap().unwrap_or(0),
             stats.transport_error.lock().unwrap().clone(),
         );
+        // Budget: Audio zählt wie jede andere Anfrage (Kosten nach Zeichen)
+        let cost = log.cost_usd;
         log_state.log_sink.log(log);
+        if cost > 0.0 {
+            log_state.track_spend(log_vk.id, cost);
+        }
     });
 
     Ok(ProxyOutcome {
@@ -712,8 +717,18 @@ where
     })
 }
 
+/// Kosten einer Sprachausgabe: wie bei kommerziellen TTS-Diensten (OpenAI TTS,
+/// ElevenLabs) nach Zeichen des gesprochenen Textes. Der Input-Preis des Modells
+/// gilt bei `/v1/audio/speech` als USD pro 1 Mio. Zeichen – so zeigt yalr auch für
+/// lokal erzeugte Sprache, was ein Cloud-Dienst gekostet hätte.
+fn audio_cost(req_json: &Value, target: &RouteTarget) -> f64 {
+    let zeichen = req_json.get("input").and_then(|v| v.as_str()).map(|s| s.chars().count()).unwrap_or(0);
+    zeichen as f64 / 1_000_000.0 * target.input_price_per_million
+}
+
 /// Protokolleintrag einer gestreamten Audio-Antwort: Typ und Größe statt der
-/// Datei, keine Tokens, keine Kosten. Ein Abbruch des Providers zählt als 502.
+/// Datei, keine Tokens; Kosten nach Zeichen (`audio_cost`), nur bei Erfolg.
+/// Ein Abbruch des Providers zählt als 502.
 #[allow(clippy::too_many_arguments)]
 fn audio_stream_log(
     target: &RouteTarget,
@@ -751,7 +766,7 @@ fn audio_stream_log(
         prompt_tokens: 0,
         completion_tokens: 0,
         total_tokens: 0,
-        cost_usd: 0.0,
+        cost_usd: if status == 200 { audio_cost(req_json, target) } else { 0.0 },
         duration_ms,
         first_byte_ms,
         request_body: redact_for_log(req_json),
@@ -2290,6 +2305,32 @@ mod tests {
         assert_eq!(ok.response_body, json!({ "content_type": "audio/mpeg", "bytes": 107_328 }).to_string());
         let kaputt = audio_stream_log(&target, &routing, &vk, "r2", AUDIO_SPEECH, &json!({}), "audio/mpeg", 10, 50, 5, Some("reset".into()));
         assert_eq!((kaputt.status, kaputt.error_type.as_str()), (502, "provider_network"));
+    }
+
+    #[test]
+    fn test_audio_kosten_nach_zeichen() {
+        // 30 $ pro 1 Mio. Zeichen (Größenordnung OpenAI tts-1-hd); Umlaute zählen als ein Zeichen
+        let target = RouteTarget { input_price_per_million: 30.0, ..scope_target(Uuid::new_v4(), "terra-ai-voice-v1") };
+        let routing = RoutingInfo::new("terra-ai-voice-v1".into(), "terra-ai-voice-v1".into());
+        let vk = common::state::VirtualKey {
+            id: Uuid::new_v4(),
+            name: "terra".into(),
+            key_hash: String::new(),
+            budget_cents: None,
+            enabled: true,
+            allowed_providers: vec![],
+            allowed_models: vec![],
+        };
+        let text = "Grüße aus Altenessen.".repeat(1000); // 21 Zeichen × 1000
+        let ok = audio_stream_log(&target, &routing, &vk, "r1", AUDIO_SPEECH, &json!({ "input": text }), "audio/mpeg", 1, 1, 1, None);
+        assert!((ok.cost_usd - 21_000.0 / 1_000_000.0 * 30.0).abs() < 1e-12, "{}", ok.cost_usd);
+        assert_eq!((ok.prompt_tokens, ok.total_tokens), (0, 0), "Zeichen sind keine Tokens");
+        // Abbruch: keine Kosten
+        let kaputt = audio_stream_log(&target, &routing, &vk, "r2", AUDIO_SPEECH, &json!({ "input": "Hallo" }), "audio/mpeg", 1, 1, 1, Some("reset".into()));
+        assert_eq!(kaputt.cost_usd, 0.0);
+        // ohne Text oder ohne Preis: 0
+        assert_eq!(audio_cost(&json!({}), &target), 0.0);
+        assert_eq!(audio_cost(&json!({ "input": "Hallo" }), &scope_target(Uuid::new_v4(), "v")), 0.0);
     }
 
     #[test]

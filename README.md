@@ -28,7 +28,10 @@ YALR is a self-hosted LLM gateway (similar to Helicone/LiteLLM) written in Rust:
   an optional note. Unlike fallbacks, a redirect takes precedence over the
   model's own route; the target's fallback chains still apply
 - **Logging & Costs**: every request is logged asynchronously (without blocking
-  the hot path) to ClickHouse, including token usage and costs; 90-day TTL
+  the hot path) to ClickHouse, including token usage and costs; 90-day TTL.
+  Speech (`/v1/audio/speech`) is priced per character like commercial TTS
+  services: the model's input price counts as USD per 1M characters of text,
+  so locally generated audio shows what a cloud service would have cost
 - **Playground**: dashboard page to try models through the regular
   routing pipeline (redirects, fallbacks, retries) — chat with optional
   provider pin, sampling parameters, streaming, reasoning on/off + effort,

@@ -230,8 +230,8 @@ export function ModelsSection({ providers, models, refresh }: Props) {
             <Input className="w-full sm:w-52" placeholder={t("upstream_placeholder")} value={mUpstream} onChange={(e) => setMUpstream(e.target.value)} />
           </div>
           <div className="space-y-2">
-            <Label>{t("input_price")}</Label>
-            <Input className="w-full sm:w-28" type="number" step="0.0001" min="0" value={mInputPrice} onChange={(e) => setMInputPrice(e.target.value)} />
+            <Label title={t("input_price_hint")}>{t("input_price")}</Label>
+            <Input className="w-full sm:w-28" type="number" step="0.0001" min="0" title={t("input_price_hint")} value={mInputPrice} onChange={(e) => setMInputPrice(e.target.value)} />
           </div>
           <div className="space-y-2">
             <Label>{t("output_price")}</Label>
