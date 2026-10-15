@@ -17,6 +17,12 @@ YALR is a self-hosted LLM gateway (similar to Helicone/LiteLLM) written in Rust:
   unrestricted); requests can be filtered by key name in the dashboard
 - **Fallbacks & Retries**: per-model fallback chains, automatic retries on
   transient errors (429/5xx/network)
+- **Load Balancing (opt-in)**: if several primary targets of a model carry
+  `"load_balance": true` in their capabilities, each request goes to the one
+  with the fewest requests in flight (streams count until they end), ties
+  round-robin. Targets without the flag keep their order behind them (e.g. a
+  slower machine as reserve), then the fallback chains. Without the flag,
+  same-named targets stay an ordered list as before
 - **Temporary Redirects**: deliberate model reroutes (A → B) that always
   apply, even while A is healthy — single-hop, at most one per model, with
   an optional note. Unlike fallbacks, a redirect takes precedence over the

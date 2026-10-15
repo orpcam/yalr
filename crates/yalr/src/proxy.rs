@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use common::auth;
-use common::state::AppState;
+use common::state::{AppState, InflightGuard};
 use ingest::{LiveEvent, LiveLog, RequestLog};
 use providers::{compute_cost, estimate_tokens, ProviderError, ProviderKind, RouteTarget};
 
@@ -393,8 +393,14 @@ async fn proxy_pipeline(
     for (attempt, target) in targets.iter().enumerate() {
         attempts_made = attempts_made.saturating_add(1);
         let attempt_start = Instant::now();
+        // Lastverteilung: zählt, solange die Anfrage an diesem Target läuft
+        let guard = state.inflight_begin(target);
         match execute_once(state, target, &vk, &endpoint, &req_json, &request_id, wants_stream, native_anthropic, &routing).await {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
+                if outcome.log.is_stream {
+                    // Streams laufen über das Ende dieser Funktion hinaus
+                    outcome.response = halten_bis_ende(outcome.response, guard);
+                }
                 // bedienender Target (Index `attempt`) fuer x-yalr-*-Header
                 meta.provider_name = Some(target.provider_name.clone());
                 meta.model_name = Some(target.model_name.clone());
@@ -455,6 +461,17 @@ async fn proxy_pipeline(
     // bei nicht-retryablem Fehler zahlt nicht alle Targets der Route)
     meta.attempts = Some(attempts_made);
     error_response(state.clone(), Some(&routing), Some(&vk), &request_id, &endpoint, started, status, error_type, &err.to_string(), attempts_made.min(255), &body).await
+}
+
+/// Hält den Lastverteilungs-Guard, bis der Antwort-Strom zu Ende ist oder der
+/// Client aufgelegt hat.
+fn halten_bis_ende(response: Response, guard: InflightGuard) -> Response {
+    let (parts, body) = response.into_parts();
+    let strom = body.into_data_stream().map(move |c| {
+        let _ = &guard;
+        c
+    });
+    Response::from_parts(parts, Body::from_stream(strom))
 }
 
 /// Ein einzelner Provider-Versuch.
@@ -2831,6 +2848,7 @@ mod playground_tests {
                 }),
             )
             .route("/fail/chat/completions", post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }))
+            .route("/ok/audio/speech", post(|| async { ([("content-type", "audio/mpeg")], vec![7u8; 4096]) }))
             .route(
                 "/sse/chat/completions",
                 post(|| async {
@@ -3042,6 +3060,45 @@ mod playground_tests {
         assert_eq!(hdr(&resp, "x-yalr-upstream-model"), Some("up-fb"));
         assert_eq!(hdr(&resp, "x-yalr-fallback"), Some("1"));
         assert_eq!(hdr(&resp, "x-yalr-attempts"), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn test_lastverteilung_zwei_stimm_targets() {
+        let base = mock_upstream().await;
+        let state = test_state();
+        let verteilt = |name: &str| RouteTarget {
+            capabilities: Some(json!({"load_balance": true})),
+            ..target(&format!("{base}/ok"), name, "voice", "voice")
+        };
+        let (a, b) = (verteilt("ironhide-1"), verteilt("ironhide-2"));
+        state.routes.write().await.insert("voice".into(), vec![a.clone(), b.clone()]);
+        const SPEECH: &str = r#"{"model":"voice","input":"hallo","voice":"terra"}"#;
+
+        // reihum, solange keine Anfrage offen ist
+        let mut bedient = Vec::new();
+        for _ in 0..4 {
+            let resp = crate::playground::handle_for_test(&state, json_request(SPEECH), "/v1/audio/speech", Ok(())).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            bedient.push(hdr(&resp, "x-yalr-provider").unwrap().to_string());
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        }
+        assert_eq!(bedient, vec!["ironhide-1", "ironhide-2", "ironhide-1", "ironhide-2"]);
+        assert_eq!(state.inflight_count(&a) + state.inflight_count(&b), 0);
+
+        // eine offene (noch nicht gelesene) Antwort zählt mit – die nächste geht ans andere Target
+        let offen = crate::playground::handle_for_test(&state, json_request(SPEECH), "/v1/audio/speech", Ok(())).await;
+        let erster = hdr(&offen, "x-yalr-provider").unwrap().to_string();
+        let (t_offen, t_frei) = if erster == "ironhide-1" { (&a, &b) } else { (&b, &a) };
+        assert_eq!(state.inflight_count(t_offen), 1);
+        for _ in 0..3 {
+            let resp = crate::playground::handle_for_test(&state, json_request(SPEECH), "/v1/audio/speech", Ok(())).await;
+            assert_eq!(hdr(&resp, "x-yalr-provider").unwrap(), t_frei.provider_name);
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        }
+        // Strom zu Ende gelesen: Zähler wieder 0
+        let daten = axum::body::to_bytes(offen.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(daten.len(), 4096);
+        assert_eq!(state.inflight_count(t_offen), 0);
     }
 
     #[tokio::test]

@@ -906,9 +906,9 @@ fn validate_capabilities(v: &Value) -> Result<(), String> {
     };
     for (key, val) in obj {
         match key.as_str() {
-            "attachment" => {
+            "attachment" | "load_balance" => {
                 if !val.is_boolean() {
-                    return Err("capabilities.attachment must be a boolean".to_string());
+                    return Err(format!("capabilities.{key} must be a boolean"));
                 }
             }
             "modalities" => {

@@ -1,7 +1,8 @@
 //! AppState: DB-Pools, HTTP-Client, Key-Cache und Model-Routing-Tabelle.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -85,6 +86,36 @@ pub struct AppStateInner {
     pub metrics_snapshot: Arc<RwLock<MetricsSnapshot>>,
     /// Optionaler Token fuer GET /metrics (None = Endpoint offen).
     pub metrics_token: Option<String>,
+    /// Lastverteilung: laufende Anfragen je Target (s. `target_key`). Haben
+    /// mehrere primäre Targets eines Modells `"load_balance": true` in den
+    /// Capabilities, geht die Anfrage an das mit den wenigsten.
+    pub inflight: Mutex<HashMap<String, Arc<AtomicUsize>>>,
+    /// Lastverteilung: Reihum-Zähler je Modell – entscheidet bei Gleichstand.
+    pub round_robin: Mutex<HashMap<String, usize>>,
+}
+
+/// Zählt eine laufende Anfrage an einem Target, bis er fallen gelassen wird
+/// (bei Streams erst, wenn der Strom zu Ende ist).
+pub struct InflightGuard(Arc<AtomicUsize>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Nimmt das Target an der Lastverteilung teil? (`"load_balance": true` in den Capabilities)
+fn load_balance(t: &RouteTarget) -> bool {
+    t.capabilities
+        .as_ref()
+        .and_then(|c| c.get("load_balance"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Schlüssel eines Targets für die Lastverteilung: Provider + Upstream-Modell.
+fn target_key(t: &RouteTarget) -> String {
+    format!("{}|{}", t.provider_id, t.upstream_model)
 }
 
 pub type AppState = Arc<AppStateInner>;
@@ -123,7 +154,52 @@ impl AppStateInner {
             redirects: RwLock::new(HashMap::new()),
             metrics_snapshot,
             metrics_token,
+            inflight: Mutex::new(HashMap::new()),
+            round_robin: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn inflight_counter(&self, t: &RouteTarget) -> Arc<AtomicUsize> {
+        let mut map = self.inflight.lock().unwrap();
+        map.entry(target_key(t)).or_default().clone()
+    }
+
+    /// Laufende Anfragen an einem Target (für Lastverteilung und Tests).
+    pub fn inflight_count(&self, t: &RouteTarget) -> usize {
+        self.inflight_counter(t).load(Ordering::Relaxed)
+    }
+
+    /// Meldet eine Anfrage an einem Target an; zählt, bis der Guard fällt.
+    pub fn inflight_begin(&self, t: &RouteTarget) -> InflightGuard {
+        let c = self.inflight_counter(t);
+        c.fetch_add(1, Ordering::Relaxed);
+        InflightGuard(c)
+    }
+
+    /// Ordnet die primären Targets eines Modells. Nur Targets mit
+    /// `"load_balance": true` werden verteilt: wenigste laufende Anfragen
+    /// zuerst, bei Gleichstand reihum (Startpunkt wandert je Anfrage weiter).
+    /// Sie kommen nach vorn, die übrigen behalten ihre Reihenfolge dahinter
+    /// (Ausfall-Reserve wie bisher). Weniger als zwei verteilte Targets: alles
+    /// unverändert – mehrere gleichnamige Targets bleiben sonst eine Reihenfolge.
+    fn order_primaries(&self, model_name: &str, primary: &mut Vec<RouteTarget>) {
+        if primary.iter().filter(|t| load_balance(t)).count() < 2 {
+            return;
+        }
+        let (mut verteilt, rest): (Vec<RouteTarget>, Vec<RouteTarget>) =
+            primary.drain(..).partition(load_balance);
+        let start = {
+            let mut rr = self.round_robin.lock().unwrap();
+            let n = rr.entry(model_name.to_string()).or_insert(0);
+            let start = *n % verteilt.len();
+            *n = n.wrapping_add(1);
+            start
+        };
+        verteilt.rotate_left(start);
+        // stabil: Gleichstand behält die Reihum-Reihenfolge
+        verteilt.sort_by_key(|t| self.inflight_count(t));
+        primary.extend(verteilt);
+        primary.extend(rest);
     }
 
     /// Laedt alle Routen (models + providers) aus Postgres neu.
@@ -241,7 +317,8 @@ impl AppStateInner {
     ///    hier nicht weiter).
     /// 2. Targets: primär `routes[effective]` + für jeden Namen in
     ///    `fallbacks[effective]` deren `routes` (Bestehende Fallback-Logik,
-    ///    aber auf `effective` statt `requested` angewandt).
+    ///    aber auf `effective` statt `requested` angewandt). Mehrere primäre
+    ///    Targets werden nach Last geordnet (`order_primaries`).
     pub async fn resolve_route(&self, model_name: &str) -> ResolvedRoute {
         let redirects = self.redirects.read().await;
         let routes = self.routes.read().await;
@@ -256,6 +333,8 @@ impl AppStateInner {
         let mut result: Vec<RouteTarget> = Vec::new();
         if let Some(primary) = routes.get(&effective) {
             result.extend(primary.iter().cloned());
+            // mehrere primäre Targets: Last verteilen (Fallbacks bleiben dahinter)
+            self.order_primaries(&effective, &mut result);
         }
         if let Some(fb_names) = fallbacks.get(&effective) {
             for fb_name in fb_names {
@@ -548,5 +627,102 @@ mod tests {
         let resolved = state.resolve_route("A").await;
         assert_eq!(resolved.effective, "B");
         assert!(resolved.targets.is_none());
+    }
+
+    fn mk_named(model: &str, provider: &str) -> RouteTarget {
+        RouteTarget {
+            provider_name: provider.into(),
+            capabilities: Some(serde_json::json!({"load_balance": true})),
+            ..mk_target(model)
+        }
+    }
+
+    fn provider_names(targets: &Option<Vec<RouteTarget>>) -> Vec<String> {
+        targets.clone().unwrap_or_default().into_iter().map(|t| t.provider_name).collect()
+    }
+
+    #[tokio::test]
+    async fn test_mehrere_primaere_reihum_fallback_bleibt_hinten() {
+        let mut routes = HashMap::new();
+        routes.insert("V".to_string(), vec![mk_named("V", "p1"), mk_named("V", "p2"), mk_named("V", "p3")]);
+        routes.insert("F".to_string(), vec![mk_named("F", "fb")]);
+        let mut fb = HashMap::new();
+        fb.insert("V".to_string(), vec!["F".to_string()]);
+        let state = state_with(routes, fb, HashMap::new()).await;
+
+        let mut erste = Vec::new();
+        for _ in 0..6 {
+            let r = state.resolve_route("V").await;
+            let namen = provider_names(&r.targets);
+            assert_eq!(namen.len(), 4);
+            assert_eq!(namen[3], "fb", "Fallback immer zuletzt");
+            erste.push(namen[0].clone());
+        }
+        assert_eq!(erste, vec!["p1", "p2", "p3", "p1", "p2", "p3"]);
+    }
+
+    #[tokio::test]
+    async fn test_wenigste_laufende_anfragen_zuerst() {
+        let mut routes = HashMap::new();
+        let (a, b) = (mk_named("V", "a"), mk_named("V", "b"));
+        routes.insert("V".to_string(), vec![a.clone(), b.clone()]);
+        let state = state_with(routes, HashMap::new(), HashMap::new()).await;
+
+        // a ist beschäftigt: b gewinnt, egal wo der Reihum-Zähler steht
+        let g1 = state.inflight_begin(&a);
+        let g2 = state.inflight_begin(&a);
+        assert_eq!(state.inflight_count(&a), 2);
+        for _ in 0..4 {
+            assert_eq!(provider_names(&state.resolve_route("V").await.targets)[0], "b");
+        }
+        // b bekommt mehr als a: jetzt wieder a
+        let _g3 = state.inflight_begin(&b);
+        let _g4 = state.inflight_begin(&b);
+        let _g5 = state.inflight_begin(&b);
+        assert_eq!(provider_names(&state.resolve_route("V").await.targets)[0], "a");
+        // Guards fallen: Zähler zurück
+        drop(g1);
+        drop(g2);
+        assert_eq!(state.inflight_count(&a), 0);
+        assert_eq!(state.inflight_count(&b), 3);
+    }
+
+    #[tokio::test]
+    async fn test_ohne_schalter_bleibt_reihenfolge() {
+        // gleichnamige Targets ohne "load_balance": erstes ist primär, Rest Reserve – wie bisher
+        let mut routes = HashMap::new();
+        let mut reserve = mk_named("M", "teuer");
+        reserve.capabilities = None;
+        let mut erstes = mk_named("M", "haupt");
+        erstes.capabilities = Some(serde_json::json!({"attachment": true}));
+        routes.insert("M".to_string(), vec![erstes, reserve]);
+        let state = state_with(routes, HashMap::new(), HashMap::new()).await;
+        for _ in 0..4 {
+            assert_eq!(provider_names(&state.resolve_route("M").await.targets), vec!["haupt", "teuer"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gemischt_verteilte_vorn_reserve_dahinter() {
+        let mut routes = HashMap::new();
+        let mut reserve = mk_named("V", "jazz");
+        reserve.capabilities = None;
+        routes.insert("V".to_string(), vec![reserve, mk_named("V", "i1"), mk_named("V", "i2")]);
+        let state = state_with(routes, HashMap::new(), HashMap::new()).await;
+        let a = provider_names(&state.resolve_route("V").await.targets);
+        let b = provider_names(&state.resolve_route("V").await.targets);
+        assert_eq!(a, vec!["i1", "i2", "jazz"]);
+        assert_eq!(b, vec!["i2", "i1", "jazz"]);
+    }
+
+    #[tokio::test]
+    async fn test_ein_primaeres_target_unveraendert() {
+        let mut routes = HashMap::new();
+        routes.insert("A".to_string(), vec![mk_named("A", "x")]);
+        let state = state_with(routes, HashMap::new(), HashMap::new()).await;
+        for _ in 0..3 {
+            assert_eq!(provider_names(&state.resolve_route("A").await.targets), vec!["x"]);
+        }
+        assert!(state.round_robin.lock().unwrap().is_empty(), "kein Zähler für Einzel-Targets");
     }
 }
