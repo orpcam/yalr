@@ -691,10 +691,10 @@ fn count_audio_stream<S, E, F>(
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static
 where
     S: futures::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
-    E: std::fmt::Display,
+    E: std::fmt::Display + Send + 'static,
     F: Fn(u64) + Send + 'static,
 {
-    upstream.map(move |chunk| {
+    bis_zum_ersten_fehler(upstream).map(move |chunk| {
         let _ = &done;
         match chunk {
             Ok(c) => {
@@ -968,6 +968,23 @@ impl StreamHealth {
     }
 }
 
+/// Endet nach dem ersten Fehler des Upstream-Stroms. Ein Body, dessen
+/// Lese-Timeout abgelaufen ist, liefert sonst bei jedem weiteren Poll sofort
+/// wieder einen Fehler – ohne je zu enden; jeder Fehler wuerde hier zu einem
+/// leeren Stueck, und Client wie Log-Collector bekaemen sie in einer Schleife.
+fn bis_zum_ersten_fehler<S, T, E>(upstream: S) -> impl futures::Stream<Item = Result<T, E>>
+where
+    S: futures::Stream<Item = Result<T, E>>,
+{
+    upstream.scan(false, |fehler, item| {
+        if *fehler {
+            return futures::future::ready(None);
+        }
+        *fehler = item.is_err();
+        futures::future::ready(Some(item))
+    })
+}
+
 /// Drained den log-channel bis zum channel-schluss (damit health-fehler am
 /// stream-ende nicht verloren gehen) und behaelt nur die neusten 256 KB
 /// (tail), damit spaete in-band-fehler-events und der finale usage-chunk im
@@ -977,6 +994,11 @@ async fn drain_log_rx(mut log_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>) -> 
     let mut chunks: Vec<bytes::Bytes> = Vec::new();
     let mut total: usize = 0;
     while let Some(part) = log_rx.recv().await {
+        // leere stuecke tragen nichts zum transcript bei; sie wuerden die liste
+        // nur ohne grenze wachsen lassen (die grenze zaehlt bytes, nicht stuecke)
+        if part.is_empty() {
+            continue;
+        }
         chunks.push(part);
         total += chunks.last().unwrap().len();
         // bei ueberschreitung von vorn verwerfen, damit der stream-tail bleibt
@@ -1029,8 +1051,7 @@ where
     // log-status wird 502.
     let health = StreamHealth::new();
     let health_map = health.clone();
-    let stream = resp
-        .bytes_stream()
+    let stream = bis_zum_ersten_fehler(resp.bytes_stream())
         .map(move |chunk| {
             let chunk = match chunk {
                 Ok(c) => c,
@@ -2295,6 +2316,98 @@ pub async fn models_list(State(state): State<AppState>, headers: HeaderMap) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_bis_zum_ersten_fehler_endet_auch_bei_endlosen_fehlern() {
+        let quelle = futures::stream::iter(vec![Ok::<_, String>(bytes::Bytes::from("a"))])
+            .chain(futures::stream::repeat(Err("timeout".to_string())));
+        let items: Vec<_> = tokio::time::timeout(Duration::from_secs(2), bis_zum_ersten_fehler(quelle).collect::<Vec<_>>())
+            .await
+            .expect("stream must end after the first error");
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_ok());
+        assert!(items[1].is_err());
+    }
+
+    #[tokio::test]
+    async fn test_drain_log_rx_ignores_empty_chunks() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
+        let sender = tokio::spawn(async move {
+            for _ in 0..50_000 {
+                tx.send(bytes::Bytes::new()).await.unwrap();
+            }
+            tx.send(bytes::Bytes::from("data")).await.unwrap();
+            for _ in 0..50_000 {
+                tx.send(bytes::Bytes::new()).await.unwrap();
+            }
+        });
+        let full = drain_log_rx(rx).await;
+        sender.await.unwrap();
+        assert_eq!(full, b"data");
+    }
+
+    /// Ein Upstream, der nach den Kopfzeilen schweigt (Anfrage in der Warteschlange): Der Lese-Timeout greift, danach
+    /// endet der Strom – statt in einer Schleife immer neue Fehler zu liefern.
+    #[tokio::test]
+    async fn test_read_timeout_ends_upstream_stream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            tokio::io::AsyncWriteExt::write_all(
+                &mut sock,
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(sock);
+        });
+        let client = reqwest::Client::builder().read_timeout(Duration::from_millis(200)).build().unwrap();
+        let resp = client.get(format!("http://{addr}/")).send().await.unwrap();
+        let items: Vec<_> = tokio::time::timeout(Duration::from_secs(3), bis_zum_ersten_fehler(resp.bytes_stream()).collect::<Vec<_>>())
+            .await
+            .expect("stream must end after the read timeout");
+        assert_eq!(items.len(), 1);
+        assert!(items[0].is_err());
+        server.abort();
+    }
+
+    /// Nur zum Nachsehen (cargo test -- --ignored): wie oft liefert ein Body nach abgelaufenem Lese-Timeout einen Fehler?
+    #[tokio::test]
+    #[ignore]
+    async fn probe_raw_stream_after_read_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            tokio::io::AsyncWriteExt::write_all(
+                &mut sock,
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let client = reqwest::Client::builder().read_timeout(Duration::from_millis(200)).build().unwrap();
+        let resp = client.get(format!("http://{addr}/")).send().await.unwrap();
+        let mut s = resp.bytes_stream();
+        let mut fehler = 0usize;
+        let ende = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < ende {
+            match tokio::time::timeout(Duration::from_millis(500), s.next()).await {
+                Ok(Some(Err(_))) => fehler += 1,
+                Ok(Some(Ok(_))) => {}
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        eprintln!("errors within 1 s after the read timeout: {fehler}");
+    }
 
     #[tokio::test]
     async fn test_count_audio_stream_passes_chunks_and_counts() {

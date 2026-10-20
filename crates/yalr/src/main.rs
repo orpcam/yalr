@@ -63,7 +63,10 @@ async fn main() -> anyhow::Result<()> {
     let http_client = reqwest::Client::builder()
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .connect_timeout(std::time::Duration::from_secs(10))
-        .read_timeout(std::time::Duration::from_secs(300))
+        // lokale modelle stellen anfragen in eine warteschlange: bis das erste
+        // byte kommt, koennen bei voller auslastung weit mehr als 5 minuten
+        // vergehen. der timeout gilt je lesevorgang, nicht fuer die ganze antwort.
+        .read_timeout(std::time::Duration::from_secs(2 * 60 * 60))
         .build()?;
 
     let state: AppState = Arc::new(AppStateInner::new(
