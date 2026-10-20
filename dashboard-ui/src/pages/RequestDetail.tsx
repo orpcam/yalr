@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
+import { Copy } from "lucide-react";
 import { api, LogEntry } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useToast } from "@/components/ui/toast";
+import { copyText } from "@/lib/clipboard";
 import { extractRequestText, extractStreamText, prettyJson } from "@/lib/logText";
 import { useLanguage, useCurrency } from "@/lib/i18n";
 
@@ -21,6 +24,7 @@ export default function RequestDetail() {
   const [error, setError] = useState<string | null>(null);
   const [showText, setShowText] = useState(true);
   const { t, formatDateTime, formatDuration } = useLanguage();
+  const toast = useToast();
   const { formatCost } = useCurrency();
 
   const load = useCallback(async () => {
@@ -65,6 +69,24 @@ export default function RequestDetail() {
   const streamText = log.is_stream && log.response_body ? extractStreamText(log.response_body) : null;
   const showRequestText = showText && requestText;
   const showStreamText = showText && streamText;
+  // kopiert wird, was gerade zu sehen ist (text- oder roh-ansicht)
+  const requestCopy = showRequestText ? requestText.content : log.request_body ? prettyJson(log.request_body) : "";
+  const responseCopy = showStreamText ? streamText.content : log.response_body ? prettyJson(log.response_body) : "";
+  const copyButton = (text: string) => (
+    <Button
+      size="sm"
+      variant="outline"
+      disabled={!text}
+      onClick={() =>
+        copyText(text)
+          .then(() => toast.success(t("copied")))
+          .catch(() => toast.error(t("pg_copy_failed")))
+      }
+    >
+      <Copy className="mr-1.5 h-3.5 w-3.5" />
+      {t("copy")}
+    </Button>
+  );
 
   return (
     <div className="space-y-6">
@@ -208,16 +230,19 @@ export default function RequestDetail() {
                 </Badge>
               )}
             </div>
-            {requestText && (
-              <div className="flex gap-1">
-                <Button size="sm" variant={showText ? "ghost" : "default"} onClick={() => setShowText(false)}>
-                  {t("view_raw")}
-                </Button>
-                <Button size="sm" variant={showText ? "default" : "ghost"} onClick={() => setShowText(true)}>
-                  {t("view_text")}
-                </Button>
-              </div>
-            )}
+            <div className="flex gap-1">
+              {requestText && (
+                <>
+                  <Button size="sm" variant={showText ? "ghost" : "default"} onClick={() => setShowText(false)}>
+                    {t("view_raw")}
+                  </Button>
+                  <Button size="sm" variant={showText ? "default" : "ghost"} onClick={() => setShowText(true)}>
+                    {t("view_text")}
+                  </Button>
+                </>
+              )}
+              {copyButton(requestCopy)}
+            </div>
           </CardHeader>
           <CardContent>
             {showRequestText ? (
@@ -241,16 +266,19 @@ export default function RequestDetail() {
                 </Badge>
               )}
             </div>
-            {streamText && (
-              <div className="flex gap-1">
-                <Button size="sm" variant={showText ? "ghost" : "default"} onClick={() => setShowText(false)}>
-                  {t("view_raw")}
-                </Button>
-                <Button size="sm" variant={showText ? "default" : "ghost"} onClick={() => setShowText(true)}>
-                  {t("view_text")}
-                </Button>
-              </div>
-            )}
+            <div className="flex gap-1">
+              {streamText && (
+                <>
+                  <Button size="sm" variant={showText ? "ghost" : "default"} onClick={() => setShowText(false)}>
+                    {t("view_raw")}
+                  </Button>
+                  <Button size="sm" variant={showText ? "default" : "ghost"} onClick={() => setShowText(true)}>
+                    {t("view_text")}
+                  </Button>
+                </>
+              )}
+              {copyButton(responseCopy)}
+            </div>
           </CardHeader>
           <CardContent>
             {showStreamText ? (

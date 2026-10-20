@@ -4,21 +4,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useToast } from "@/components/ui/toast";
 import { useLanguage } from "@/lib/i18n";
 import type { Exchange } from "./ChatPanel";
+import { copyText } from "@/lib/clipboard";
 import { prettyRaw, routingHeaders } from "./helpers";
-
-async function copyText(text: string): Promise<void> {
-  if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(text);
-  // fallback fuer nicht-sichere kontexte (http ohne localhost)
-  const ta = document.createElement("textarea");
-  ta.value = text;
-  ta.style.position = "fixed";
-  ta.style.opacity = "0";
-  document.body.appendChild(ta);
-  ta.select();
-  const ok = document.execCommand("copy");
-  document.body.removeChild(ta);
-  if (!ok) throw new Error("copy failed");
-}
 
 function Block({ title, text }: { title: string; text: string }) {
   const { t } = useLanguage();
