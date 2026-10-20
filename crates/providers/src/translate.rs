@@ -227,6 +227,10 @@ fn nachdenken_setzen(anthropic_req: &mut Value, openai_req: &Value, caps: Option
 /// Das `cache_control` fuer diese anfrage: aus `capabilities.prompt_cache` des
 /// modells oder weil der client selbst eins setzt. None: kein caching.
 fn cache_control_fuer(openai_req: &Value, caps: Option<&Value>) -> Option<Value> {
+    // auch direkt als `cache_control`-objekt in den capabilities (wird so verwendet)
+    if let Some(cc) = caps.and_then(|c| c.get("cache_control")).filter(|v| v.is_object()) {
+        return Some(cc.clone());
+    }
     let vom_modell = caps.and_then(|c| c.get("prompt_cache")).and_then(|v| v.as_bool()).unwrap_or(false);
     let vom_client = openai_req
         .get("messages")
@@ -864,6 +868,11 @@ mod tests {
         let ohne = openai_request_to_anthropic(&req, "claude-x");
         assert_eq!(ohne["system"], "Lange Regeln.");
         assert_eq!(ohne["messages"][0]["content"], "Dossier");
+        // direkt als cache_control-objekt
+        let direkt = json!({"cache_control": {"type": "ephemeral", "ttl": "1h"}});
+        let out = openai_request_to_anthropic_mit(&req, "claude-x", Some(&direkt));
+        assert_eq!(out["system"][0]["cache_control"], json!({"type": "ephemeral", "ttl": "1h"}));
+        assert_eq!(out["messages"][0]["content"][0]["cache_control"], json!({"type": "ephemeral", "ttl": "1h"}));
         // laengerer cache
         let lang = json!({"prompt_cache": true, "prompt_cache_ttl": "1h"});
         let out = openai_request_to_anthropic_mit(&req, "claude-x", Some(&lang));

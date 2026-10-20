@@ -24,7 +24,8 @@ YALR is a self-hosted LLM gateway (similar to Helicone/LiteLLM) written in Rust:
   slower machine as reserve), then the fallback chains. Without the flag,
   same-named targets stay an ordered list as before
 - **Anthropic Prompt Caching & Thinking (per model, opt-in)**: with
-  `"prompt_cache": true` in a model's capabilities, OpenAI-format requests
+  `"prompt_cache": true` (or a `"cache_control"` object, used as given) in a
+  model's capabilities, OpenAI-format requests
   routed to Anthropic get `cache_control` on the system prompt and on the last
   message block (`"prompt_cache_ttl": "1h"` for the longer cache); a client's
   own `cache_control` on content parts is passed through as well.

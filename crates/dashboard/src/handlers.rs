@@ -917,6 +917,11 @@ fn validate_capabilities(v: &Value) -> Result<(), String> {
                     return Err("capabilities.prompt_cache_ttl must be \"5m\" or \"1h\"".to_string());
                 }
             }
+            "cache_control" => {
+                if val.get("type").and_then(|t| t.as_str()) != Some("ephemeral") {
+                    return Err("capabilities.cache_control must be {\"type\": \"ephemeral\"} (optional \"ttl\")".to_string());
+                }
+            }
             "cache_read_factor" | "cache_write_factor" => {
                 if !val.as_f64().is_some_and(|x| x >= 0.0) {
                     return Err(format!("capabilities.{key} must be a non-negative number"));
@@ -6135,6 +6140,8 @@ mod capabilities_tests {
             "effort": "high",
         });
         assert!(validate_capabilities(&gut).is_ok());
+        assert!(validate_capabilities(&json!({"cache_control": {"type": "ephemeral"}})).is_ok());
+        assert!(validate_capabilities(&json!({"cache_control": {"type": "persistent"}})).is_err());
         for falsch in [
             json!({"prompt_cache": "ja"}),
             json!({"prompt_cache_ttl": "2h"}),

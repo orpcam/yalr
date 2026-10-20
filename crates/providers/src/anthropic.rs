@@ -93,7 +93,8 @@ pub fn eingabe_gesamt(u: &Value) -> u64 {
 /// weil die rabatte je modellgeneration verschieden sind.
 pub fn cache_faktoren(caps: Option<&Value>) -> (f64, f64) {
     let zahl = |k: &str| caps.and_then(|c| c.get(k)).and_then(|v| v.as_f64()).filter(|x| *x >= 0.0);
-    let lang = caps.and_then(|c| c.get("prompt_cache_ttl")).and_then(|v| v.as_str()) == Some("1h");
+    let lang = caps.and_then(|c| c.get("prompt_cache_ttl")).and_then(|v| v.as_str()) == Some("1h")
+        || caps.and_then(|c| c.pointer("/cache_control/ttl")).and_then(|v| v.as_str()) == Some("1h");
     (
         zahl("cache_write_factor").unwrap_or(if lang { 2.0 } else { 1.25 }),
         zahl("cache_read_factor").unwrap_or(0.1),
