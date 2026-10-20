@@ -23,6 +23,17 @@ YALR is a self-hosted LLM gateway (similar to Helicone/LiteLLM) written in Rust:
   round-robin. Targets without the flag keep their order behind them (e.g. a
   slower machine as reserve), then the fallback chains. Without the flag,
   same-named targets stay an ordered list as before
+- **Anthropic Prompt Caching & Thinking (per model, opt-in)**: with
+  `"prompt_cache": true` in a model's capabilities, OpenAI-format requests
+  routed to Anthropic get `cache_control` on the system prompt and on the last
+  message block (`"prompt_cache_ttl": "1h"` for the longer cache); a client's
+  own `cache_control` on content parts is passed through as well.
+  `"thinking": "adaptive"` maps `reasoning_effort` to adaptive thinking with
+  `output_config.effort` (default from `"effort"`, `none` turns it off;
+  temperature/top_p are dropped then, `"thinking_display"` is passed on).
+  Clients see cached input in `usage.prompt_tokens_details`; logged costs
+  weight cache writes ×1.25 (×2 for `1h`) and cache reads ×0.1 of the input
+  price, overridable per model with `cache_write_factor` / `cache_read_factor`
 - **Temporary Redirects**: deliberate model reroutes (A → B) that always
   apply, even while A is healthy — single-hop, at most one per model, with
   an optional note. Unlike fallbacks, a redirect takes precedence over the

@@ -800,7 +800,7 @@ async fn anthropic_call(
     let (upstream_body, is_native) = if native_anthropic {
         (req_json.clone(), true)
     } else {
-        (providers::translate::openai_request_to_anthropic(req_json, &target.upstream_model), false)
+        (providers::translate::openai_request_to_anthropic_mit(req_json, &target.upstream_model, target.capabilities.as_ref()), false)
     };
     let mut upstream_body = upstream_body;
     upstream_body["model"] = json!(target.upstream_model);
@@ -837,7 +837,7 @@ async fn anthropic_call(
         let anthropic_resp: Value = serde_json::from_slice(&bytes)
             .map_err(|e| ProviderError::Status { status: 502, body: format!("invalid upstream json: {e}") })?;
 
-        let usage = providers::anthropic::AnthropicAdapter::extract_usage(&anthropic_resp);
+        let usage = providers::anthropic::AnthropicAdapter::extract_usage(&anthropic_resp, target.capabilities.as_ref());
         let (out, log_resp_json) = if is_native {
             let mut o = anthropic_resp.clone();
             o["model"] = json!(target.model_name);
@@ -1127,6 +1127,7 @@ async fn stream_anthropic_to_openai(
         let mut stream = resp.bytes_stream();
         let mut buffer = String::new();
         let mut message_id = String::new();
+        let mut start_usage = Value::Null;
 
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -1177,11 +1178,18 @@ async fn stream_anthropic_to_openai(
                     if let Some(id) = data.pointer("/message/id").and_then(|v| v.as_str()) {
                         message_id = id.to_string();
                     }
+                    // eingabe-tokens (auch gecachte) kommen nur hier
+                    if let Some(u) = data.pointer("/message/usage") {
+                        start_usage = u.clone();
+                    }
                 }
 
                 let mut data = data;
                 if !message_id.is_empty() {
                     data["_message_id"] = json!(message_id);
+                }
+                if event_name == "message_delta" && !start_usage.is_null() {
+                    data["_start_usage"] = start_usage.clone();
                 }
 
                 if let Some(openai_chunk) = providers::translate::anthropic_stream_event_to_openai(
@@ -1654,22 +1662,13 @@ fn extract_stream_usage(response: &str, target: &RouteTarget) -> (u64, u64) {
             }
             (0, 0)
         }
-        ProviderKind::Anthropic => {
-            for line in response.lines().rev() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if let Ok(v) = serde_json::from_str::<Value>(data) {
-                        if let Some(u) = v.get("usage") {
-                            let p = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                            let c = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                            if p > 0 || c > 0 {
-                                return (p, c);
-                            }
-                        }
-                    }
-                }
-            }
-            (0, 0)
-        }
+        ProviderKind::Anthropic => match anthropic_stream_usage(response) {
+            Some(u) => (
+                providers::anthropic::eingabe_bepreist(&u, providers::anthropic::cache_faktoren(target.capabilities.as_ref())),
+                u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+            ),
+            None => (0, 0),
+        },
         ProviderKind::Gemini => {
             for line in response.lines().rev() {
                 if let Some(data) = line.strip_prefix("data: ") {
@@ -1687,6 +1686,46 @@ fn extract_stream_usage(response: &str, target: &RouteTarget) -> (u64, u64) {
             (0, 0)
         }
     }
+}
+
+/// Die usage eines anthropic-streams im anthropic-format – aus dem rohstream
+/// (message_start: vorlaeufig, message_delta: endgueltig samt cache-feldern) oder aus
+/// den uebersetzten openai-chunks (prompt_tokens samt prompt_tokens_details).
+fn anthropic_stream_usage(response: &str) -> Option<Value> {
+    let mut roh = serde_json::Map::new();
+    let mut openai: Option<Value> = None;
+    for line in response.lines() {
+        let Some(data) = line.strip_prefix("data: ") else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
+        let u = match v.get("type").and_then(|t| t.as_str()) {
+            Some("message_start") => v.pointer("/message/usage"),
+            Some("message_delta") => v.get("usage"),
+            _ => {
+                if let Some(u) = v.get("usage").filter(|u| u.get("prompt_tokens").is_some()) {
+                    openai = Some(u.clone());
+                }
+                None
+            }
+        };
+        if let Some(obj) = u.and_then(|u| u.as_object()) {
+            for (k, x) in obj {
+                roh.insert(k.clone(), x.clone());
+            }
+        }
+    }
+    if !roh.is_empty() {
+        return Some(Value::Object(roh));
+    }
+    let u = openai?;
+    let n = |p: &str| u.pointer(p).and_then(|x| x.as_u64()).unwrap_or(0);
+    let (gesamt, gelesen, geschrieben) =
+        (n("/prompt_tokens"), n("/prompt_tokens_details/cached_tokens"), n("/prompt_tokens_details/cache_creation_tokens"));
+    Some(json!({
+        "input_tokens": gesamt.saturating_sub(gelesen + geschrieben),
+        "cache_creation_input_tokens": geschrieben,
+        "cache_read_input_tokens": gelesen,
+        "output_tokens": n("/completion_tokens"),
+    }))
 }
 
 /// Extrahiert sichtbaren text aus einem openai-SSE-mitschnitt (fuer token-schaetzung).
@@ -1865,19 +1904,23 @@ fn anthropic_stream_parts(response: &str) -> (String, String, (u64, u64), bool, 
                 if let Some(stop) = v.pointer("/delta/stop_reason").and_then(|s| s.as_str()) {
                     finish_reason = stop.to_string();
                 }
-                if let Some(u) = v.get("usage") {
-                    let p = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                    let c = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                    if p > 0 || c > 0 {
-                        usage = (p, c);
-                    }
-                }
                 saw_done = true; // message_delta ist das letzte relevante event vor message_stop
             }
             "message_stop" => {
                 saw_done = true;
             }
             _ => {}
+        }
+    }
+
+    // eingabe aus message_start/message_delta (alle eingabe-tokens, auch gecachte)
+    if let Some(u) = anthropic_stream_usage(response) {
+        let (p, c) = (
+            providers::anthropic::eingabe_gesamt(&u),
+            u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+        );
+        if p > 0 || c > 0 {
+            usage = (p, c);
         }
     }
 
@@ -2481,6 +2524,27 @@ mod tests {
         assert_eq!(usage, (5, 2));
         assert!(saw_done);
         assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn test_anthropic_stream_usage_mit_cache() {
+        // message_start nennt die eingabe vorlaeufig, message_delta endgueltig samt cache
+        let sse = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":0,\"output_tokens\":1}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":2000}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (_, _, usage, _, _) = anthropic_stream_parts(sse);
+        assert_eq!(usage, (2110, 7), "alle eingabe-tokens");
+        let u = anthropic_stream_usage(sse).unwrap();
+        // kosten: 10 + 100*1,25 + 2000*0,1 = 335
+        assert_eq!(providers::anthropic::eingabe_bepreist(&u, providers::anthropic::cache_faktoren(None)), 335);
+        // uebersetzte openai-chunks (prompt_tokens samt details) ergeben dieselbe usage
+        let openai = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2110,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":2000,\"cache_creation_tokens\":100}}}\n\ndata: [DONE]\n\n";
+        let u2 = anthropic_stream_usage(openai).unwrap();
+        assert_eq!(providers::anthropic::eingabe_bepreist(&u2, providers::anthropic::cache_faktoren(None)), 335);
+        assert_eq!(u2["output_tokens"], 7);
     }
 
     #[test]

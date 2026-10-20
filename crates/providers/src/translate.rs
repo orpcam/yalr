@@ -9,8 +9,22 @@ use serde_json::{json, Value};
 // OpenAI -> Anthropic
 // ============================================================
 
-/// OpenAI chat.completions request -> Anthropic messages request.
+/// OpenAI chat.completions request -> Anthropic messages request (ohne modell-einstellungen).
 pub fn openai_request_to_anthropic(openai_req: &Value, upstream_model: &str) -> Value {
+    openai_request_to_anthropic_mit(openai_req, upstream_model, None)
+}
+
+/// Wie [openai_request_to_anthropic], mit den `capabilities` des modells:
+/// - `prompt_cache: true` (oder der client setzt selbst irgendwo `cache_control`):
+///   system-prompt und letzter block der letzten nachricht bekommen
+///   `cache_control` (anthropic prompt caching). `prompt_cache_ttl: "1h"` waehlt
+///   den laengeren cache; ohne angabe gelten die 5 minuten von anthropic.
+/// - `thinking: "adaptive"` (neuere claude-modelle): `reasoning_effort` des
+///   clients (sonst `effort` aus den capabilities) wird zu adaptivem nachdenken
+///   mit `output_config.effort`; `none`/`minimal` schaltet es ab. Mit nachdenken
+///   entfallen temperature/top_p/top_k (dort nicht erlaubt). `thinking_display`
+///   (`summarized`/`omitted`) wird durchgereicht.
+pub fn openai_request_to_anthropic_mit(openai_req: &Value, upstream_model: &str, caps: Option<&Value>) -> Value {
     let mut messages = Vec::new();
     let mut system = Vec::new();
 
@@ -72,7 +86,7 @@ pub fn openai_request_to_anthropic(openai_req: &Value, upstream_model: &str) -> 
                             .iter()
                             .filter_map(|part| {
                                 let ty = part.get("type").and_then(|t| t.as_str())?;
-                                match ty {
+                                let mut block = match ty {
                                     "text" => Some(json!({
                                         "type": "text",
                                         "text": part.get("text").and_then(|t| t.as_str()).unwrap_or(""),
@@ -89,7 +103,12 @@ pub fn openai_request_to_anthropic(openai_req: &Value, upstream_model: &str) -> 
                                         }))
                                     }
                                     _ => None,
+                                }?;
+                                // vom client gesetztes cache_control bleibt am block
+                                if let Some(cc) = part.get("cache_control").filter(|c| c.is_object()) {
+                                    block["cache_control"] = cc.clone();
                                 }
+                                Some(block)
                             })
                             .collect();
                         if !blocks.is_empty() {
@@ -109,8 +128,15 @@ pub fn openai_request_to_anthropic(openai_req: &Value, upstream_model: &str) -> 
         "max_tokens": openai_req.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(4096),
     });
 
+    let cache = cache_control_fuer(openai_req, caps);
     if !system.is_empty() {
-        anthropic_req["system"] = json!(system.join("\n\n"));
+        anthropic_req["system"] = match &cache {
+            Some(cc) => json!([{ "type": "text", "text": system.join("\n\n"), "cache_control": cc }]),
+            None => json!(system.join("\n\n")),
+        };
+    }
+    if let Some(cc) = &cache {
+        markiere_letzte_nachricht(&mut anthropic_req, cc);
     }
 
     if let Some(temp) = openai_req.get("temperature") {
@@ -167,7 +193,81 @@ pub fn openai_request_to_anthropic(openai_req: &Value, upstream_model: &str) -> 
         }
     }
 
+    // zuletzt: nachdenken entfernt dabei temperature/top_p/top_k
+    nachdenken_setzen(&mut anthropic_req, openai_req, caps);
     anthropic_req
+}
+
+/// Adaptives nachdenken nach `capabilities.thinking` (siehe [openai_request_to_anthropic_mit]).
+fn nachdenken_setzen(anthropic_req: &mut Value, openai_req: &Value, caps: Option<&Value>) {
+    let cap = |k: &str| caps.and_then(|c| c.get(k)).and_then(|v| v.as_str());
+    if cap("thinking") != Some("adaptive") {
+        return;
+    }
+    let effort = openai_req
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .or_else(|| cap("effort"));
+    let Some(effort) = effort.filter(|e| !matches!(*e, "none" | "minimal")) else {
+        return;
+    };
+    let mut thinking = json!({ "type": "adaptive" });
+    if let Some(d) = cap("thinking_display") {
+        thinking["display"] = json!(d);
+    }
+    anthropic_req["thinking"] = thinking;
+    anthropic_req["output_config"] = json!({ "effort": effort });
+    if let Some(o) = anthropic_req.as_object_mut() {
+        o.remove("temperature");
+        o.remove("top_p");
+        o.remove("top_k");
+    }
+}
+
+/// Das `cache_control` fuer diese anfrage: aus `capabilities.prompt_cache` des
+/// modells oder weil der client selbst eins setzt. None: kein caching.
+fn cache_control_fuer(openai_req: &Value, caps: Option<&Value>) -> Option<Value> {
+    let vom_modell = caps.and_then(|c| c.get("prompt_cache")).and_then(|v| v.as_bool()).unwrap_or(false);
+    let vom_client = openai_req
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|msgs| {
+            msgs.iter().any(|m| {
+                m.get("cache_control").is_some()
+                    || m.get("content")
+                        .and_then(|c| c.as_array())
+                        .is_some_and(|parts| parts.iter().any(|p| p.get("cache_control").is_some()))
+            })
+        })
+        .unwrap_or(false);
+    if !vom_modell && !vom_client {
+        return None;
+    }
+    let mut cc = json!({ "type": "ephemeral" });
+    if let Some(ttl) = caps.and_then(|c| c.get("prompt_cache_ttl")).and_then(|v| v.as_str()) {
+        cc["ttl"] = json!(ttl);
+    }
+    Some(cc)
+}
+
+/// Setzt `cache_control` an den letzten block der letzten nachricht (der ganze
+/// verlauf davor wird so mitgecacht). Text-inhalt wird dafuer zum block.
+fn markiere_letzte_nachricht(anthropic_req: &mut Value, cc: &Value) {
+    let Some(last) = anthropic_req
+        .get_mut("messages")
+        .and_then(|m| m.as_array_mut())
+        .and_then(|m| m.last_mut())
+    else {
+        return;
+    };
+    if let Some(text) = last.get("content").and_then(|c| c.as_str()).map(str::to_string) {
+        last["content"] = json!([{ "type": "text", "text": text }]);
+    }
+    if let Some(block) = last.get_mut("content").and_then(|c| c.as_array_mut()).and_then(|b| b.last_mut()) {
+        if block.get("cache_control").is_none() {
+            block["cache_control"] = cc.clone();
+        }
+    }
 }
 
 /// Anthropic non-stream response -> OpenAI chat.completions response.
@@ -179,6 +279,7 @@ pub fn anthropic_response_to_openai(
     let mut content_parts: Vec<Value> = Vec::new();
     let mut tool_calls = Vec::new();
     let mut text = String::new();
+    let mut reasoning = String::new();
 
     if let Some(blocks) = anthropic_resp.get("content").and_then(|c| c.as_array()) {
         for block in blocks {
@@ -187,6 +288,9 @@ pub fn anthropic_response_to_openai(
                     let t = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
                     text.push_str(t);
                     content_parts.push(json!({ "type": "text", "text": t }));
+                }
+                Some("thinking") => {
+                    reasoning.push_str(block.get("thinking").and_then(|t| t.as_str()).unwrap_or(""));
                 }
                 Some("tool_use") => {
                     let idx = tool_calls.len() as u32;
@@ -208,8 +312,6 @@ pub fn anthropic_response_to_openai(
     }
 
     let usage = anthropic_resp.get("usage").cloned().unwrap_or_else(|| json!({}));
-    let prompt_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-    let completion_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
 
     let mut message = json!({
         "role": "assistant",
@@ -217,6 +319,10 @@ pub fn anthropic_response_to_openai(
     });
     if !tool_calls.is_empty() {
         message["tool_calls"] = json!(tool_calls);
+    }
+    // nachdenken (nur, wenn anthropic einen text liefert – nicht bei display "omitted")
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = json!(reasoning);
     }
 
     let mut resp = json!({
@@ -231,11 +337,8 @@ pub fn anthropic_response_to_openai(
                 anthropic_resp.get("stop_reason").and_then(|v| v.as_str())
             ),
         }],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
+        // gecachte eingabe zaehlt mit (prompt_tokens_details)
+        "usage": crate::anthropic::usage_als_openai(&usage),
     });
 
     // Anthropic-specific erweiterungen unter keys.x-namespace
@@ -293,6 +396,18 @@ pub fn anthropic_stream_event_to_openai(event: &str, data: &Value, model_name: &
                         "delta": { "content": delta.get("text").and_then(|t| t.as_str()).unwrap_or("") },
                     }],
                 })),
+                Some("thinking_delta") => {
+                    let t = delta.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                    if t.is_empty() {
+                        return None;
+                    }
+                    Some(json!({
+                        "id": data.get("_message_id").and_then(|i| i.as_str()).unwrap_or(""),
+                        "object": "chat.completion.chunk",
+                        "model": model_name,
+                        "choices": [{ "index": 0, "delta": { "reasoning_content": t } }],
+                    }))
+                }
                 Some("input_json_delta") => {
                     let idx = data.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
                     Some(json!({
@@ -341,13 +456,15 @@ pub fn anthropic_stream_event_to_openai(event: &str, data: &Value, model_name: &
                 }],
             });
             if let Some(usage) = data.get("usage") {
-                chunk["usage"] = json!({
-                    "prompt_tokens": usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                    "completion_tokens": usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                    "total_tokens": usage
-                        .get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
-                        + usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                });
+                // die eingabe steht in message_start (vom adapter als `_start_usage`
+                // mitgegeben); was message_delta selbst nennt, gilt vorrangig.
+                let mut u = data.get("_start_usage").cloned().filter(|v| v.is_object()).unwrap_or_else(|| json!({}));
+                if let (Some(ziel), Some(neu)) = (u.as_object_mut(), usage.as_object()) {
+                    for (k, v) in neu {
+                        ziel.insert(k.clone(), v.clone());
+                    }
+                }
+                chunk["usage"] = crate::anthropic::usage_als_openai(&u);
             }
             Some(chunk)
         }
@@ -725,6 +842,120 @@ mod tests {
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[1]["role"], "assistant");
         assert_eq!(msgs[2]["role"], "user");
+    }
+
+    #[test]
+    fn test_prompt_cache_aus_capabilities() {
+        let req = json!({
+            "model": "claude",
+            "messages": [
+                {"role": "system", "content": "Lange Regeln."},
+                {"role": "user", "content": "Dossier"},
+            ],
+        });
+        let caps = json!({"prompt_cache": true});
+        let out = openai_request_to_anthropic_mit(&req, "claude-x", Some(&caps));
+        assert_eq!(out["system"][0]["text"], "Lange Regeln.");
+        assert_eq!(out["system"][0]["cache_control"], json!({"type": "ephemeral"}));
+        let letzte = &out["messages"][0]["content"][0];
+        assert_eq!(letzte["text"], "Dossier");
+        assert_eq!(letzte["cache_control"], json!({"type": "ephemeral"}));
+        // ohne capabilities: wie bisher, kein caching
+        let ohne = openai_request_to_anthropic(&req, "claude-x");
+        assert_eq!(ohne["system"], "Lange Regeln.");
+        assert_eq!(ohne["messages"][0]["content"], "Dossier");
+        // laengerer cache
+        let lang = json!({"prompt_cache": true, "prompt_cache_ttl": "1h"});
+        let out = openai_request_to_anthropic_mit(&req, "claude-x", Some(&lang));
+        assert_eq!(out["system"][0]["cache_control"], json!({"type": "ephemeral", "ttl": "1h"}));
+    }
+
+    #[test]
+    fn test_prompt_cache_vom_client() {
+        let req = json!({
+            "model": "claude",
+            "messages": [
+                {"role": "system", "content": "Regeln."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "fest", "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "neu"},
+                ]},
+            ],
+        });
+        let out = openai_request_to_anthropic(&req, "claude-x");
+        let blocks = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(blocks[1]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(out["system"][0]["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn test_adaptives_nachdenken() {
+        let req = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "reasoning_effort": "high",
+        });
+        let caps = json!({"thinking": "adaptive", "thinking_display": "summarized"});
+        let out = openai_request_to_anthropic_mit(&req, "claude-x", Some(&caps));
+        assert_eq!(out["thinking"], json!({"type": "adaptive", "display": "summarized"}));
+        assert_eq!(out["output_config"], json!({"effort": "high"}));
+        assert!(out.get("temperature").is_none());
+        assert!(out.get("top_p").is_none());
+        // ohne thinking-capability bleibt alles wie bisher
+        let ohne = openai_request_to_anthropic(&req, "claude-x");
+        assert!(ohne.get("thinking").is_none());
+        assert_eq!(ohne["temperature"], 0.7);
+        // none schaltet ab; ohne angabe gilt der standard des modells
+        let aus = openai_request_to_anthropic_mit(&json!({"messages": [], "reasoning_effort": "none"}), "x", Some(&caps));
+        assert!(aus.get("thinking").is_none());
+        let std = json!({"thinking": "adaptive", "effort": "medium"});
+        let out = openai_request_to_anthropic_mit(&json!({"messages": []}), "x", Some(&std));
+        assert_eq!(out["output_config"], json!({"effort": "medium"}));
+    }
+
+    #[test]
+    fn test_usage_mit_cache_und_nachdenken() {
+        let resp = json!({
+            "id": "msg_1",
+            "content": [
+                {"type": "thinking", "thinking": "Erst rechnen.", "signature": "sig"},
+                {"type": "text", "text": "4"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 1000, "cache_read_input_tokens": 3000},
+        });
+        let out = anthropic_response_to_openai(&resp, "claude", 1);
+        assert_eq!(out["choices"][0]["message"]["content"], "4");
+        assert_eq!(out["choices"][0]["message"]["reasoning_content"], "Erst rechnen.");
+        assert_eq!(out["usage"]["prompt_tokens"], 4010);
+        assert_eq!(out["usage"]["prompt_tokens_details"], json!({"cached_tokens": 3000, "cache_creation_tokens": 1000}));
+        // kosten: 10 + 1000*1,25 + 3000*0,1 = 1560; mit eigenem lesefaktor 0,05: 1410
+        assert_eq!(crate::anthropic::AnthropicAdapter::extract_usage(&resp, None), (1560, 5));
+        let caps = json!({"cache_read_factor": 0.05});
+        assert_eq!(crate::anthropic::AnthropicAdapter::extract_usage(&resp, Some(&caps)), (1410, 5));
+    }
+
+    #[test]
+    fn test_stream_usage_aus_message_start_und_delta() {
+        let start = json!({"input_tokens": 10, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 1});
+        let delta = json!({
+            "_start_usage": start,
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 42, "cache_read_input_tokens": 3000},
+        });
+        let chunk = anthropic_stream_event_to_openai("message_delta", &delta, "claude").unwrap();
+        assert_eq!(chunk["usage"]["prompt_tokens"], 3010);
+        assert_eq!(chunk["usage"]["completion_tokens"], 42);
+        let denk = json!({"delta": {"type": "thinking_delta", "thinking": "hm"}});
+        assert_eq!(
+            anthropic_stream_event_to_openai("content_block_delta", &denk, "claude").unwrap()["choices"][0]["delta"]["reasoning_content"],
+            "hm"
+        );
+        let leer = json!({"delta": {"type": "thinking_delta", "thinking": ""}});
+        assert!(anthropic_stream_event_to_openai("content_block_delta", &leer, "claude").is_none());
     }
 
     #[test]

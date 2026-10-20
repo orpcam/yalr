@@ -906,9 +906,35 @@ fn validate_capabilities(v: &Value) -> Result<(), String> {
     };
     for (key, val) in obj {
         match key.as_str() {
-            "attachment" | "load_balance" => {
+            "attachment" | "load_balance" | "prompt_cache" => {
                 if !val.is_boolean() {
                     return Err(format!("capabilities.{key} must be a boolean"));
+                }
+            }
+            // anthropic: prompt caching und adaptives nachdenken
+            "prompt_cache_ttl" => {
+                if !matches!(val.as_str(), Some("5m") | Some("1h")) {
+                    return Err("capabilities.prompt_cache_ttl must be \"5m\" or \"1h\"".to_string());
+                }
+            }
+            "cache_read_factor" | "cache_write_factor" => {
+                if !val.as_f64().is_some_and(|x| x >= 0.0) {
+                    return Err(format!("capabilities.{key} must be a non-negative number"));
+                }
+            }
+            "thinking" => {
+                if val.as_str() != Some("adaptive") {
+                    return Err("capabilities.thinking must be \"adaptive\"".to_string());
+                }
+            }
+            "thinking_display" => {
+                if !matches!(val.as_str(), Some("summarized") | Some("omitted")) {
+                    return Err("capabilities.thinking_display must be \"summarized\" or \"omitted\"".to_string());
+                }
+            }
+            "effort" => {
+                if !matches!(val.as_str(), Some("low") | Some("medium") | Some("high") | Some("xhigh") | Some("max")) {
+                    return Err("capabilities.effort must be low, medium, high, xhigh or max".to_string());
                 }
             }
             "modalities" => {
@@ -6089,5 +6115,35 @@ mod reserved_name_tests {
         assert!(!is_reserved_key_name("playground-2"));
         assert!(!is_reserved_key_name("terra"));
         assert_eq!(reserved_name_response().status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+mod capabilities_tests {
+    use super::validate_capabilities;
+    use serde_json::json;
+
+    #[test]
+    fn test_anthropic_capabilities() {
+        let gut = json!({
+            "prompt_cache": true,
+            "prompt_cache_ttl": "1h",
+            "cache_read_factor": 0.05,
+            "cache_write_factor": 2,
+            "thinking": "adaptive",
+            "thinking_display": "summarized",
+            "effort": "high",
+        });
+        assert!(validate_capabilities(&gut).is_ok());
+        for falsch in [
+            json!({"prompt_cache": "ja"}),
+            json!({"prompt_cache_ttl": "2h"}),
+            json!({"cache_read_factor": -1}),
+            json!({"thinking": "enabled"}),
+            json!({"thinking_display": "full"}),
+            json!({"effort": "extrem"}),
+        ] {
+            assert!(validate_capabilities(&falsch).is_err(), "{falsch}");
+        }
     }
 }
