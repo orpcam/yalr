@@ -155,8 +155,17 @@ pub enum LiveEvent {
 /// Kapazitaet des Overflow-Puffers, falls der mpsc-Channel voll ist.
 const OVERFLOW_CAP: usize = 20_000;
 
-/// TTL fuer in-flight Registry-Eintraege (15 Minuten).
-const IN_FLIGHT_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// TTL fuer in-flight Registry-Eintraege, gezaehlt ab dem letzten Lebenszeichen (Start, erstes Byte, Zwischenstand).
+/// So lang wie die Lese-Frist zum Upstream (2 h je Lesevorgang) plus Puffer: lange Streams und lange Warteschlangen
+/// lokaler Backends bleiben sichtbar, verwaiste Eintraege (nie gemeldetes Ende) verschwinden trotzdem.
+const IN_FLIGHT_TTL: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60 + 5 * 60);
+
+fn jetzt_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 /// Ein in-flight Request, der noch nicht abgeschlossen ist.
 #[derive(Debug, Clone, Serialize)]
@@ -180,6 +189,9 @@ pub struct InFlightReq {
     pub tokens_exact: bool,
     /// Tokens je Sekunde seit dem ersten erzeugten Zeichen.
     pub tokens_per_s: Option<f64>,
+    /// Letztes Lebenszeichen (epoch ms) – Basis der TTL.
+    #[serde(skip)]
+    pub last_activity_ms: u64,
 }
 
 /// Zähler-Zustand pro (provider, provider_name, model) seit Prozessstart.
@@ -361,6 +373,7 @@ impl LogSink {
                         reasoning_tokens: None,
                         tokens_exact: false,
                         tokens_per_s: None,
+                        last_activity_ms: (timestamp.timestamp_millis() as u64).max(jetzt_ms()),
                     },
                 );
             }
@@ -368,6 +381,7 @@ impl LogSink {
                 let mut guard = self.in_flight.lock().unwrap();
                 if let Some(entry) = guard.get_mut(request_id) {
                     entry.first_byte_ms = Some(*first_byte_ms);
+                    entry.last_activity_ms = jetzt_ms();
                 }
             }
             LiveEvent::Progress { request_id, generated_tokens, reasoning_tokens, tokens_exact, tokens_per_s } => {
@@ -377,6 +391,7 @@ impl LogSink {
                     entry.reasoning_tokens = Some(*reasoning_tokens);
                     entry.tokens_exact = *tokens_exact;
                     entry.tokens_per_s = *tokens_per_s;
+                    entry.last_activity_ms = jetzt_ms();
                 }
             }
             LiveEvent::Completed { log } => {
@@ -388,17 +403,14 @@ impl LogSink {
     }
 
     /// Liefert eine Snapshot-Liste aller in-flight Requests, sortiert nach
-    /// `started_at_ms` aufsteigend. Eintraege aelter als 15 Minuten werden
-    /// dabei verworfen (TTL-Sweep).
+    /// `started_at_ms` aufsteigend. Eintraege ohne Lebenszeichen seit
+    /// [`IN_FLIGHT_TTL`] werden dabei verworfen (TTL-Sweep).
     pub fn in_flight_snapshot(&self) -> Vec<InFlightReq> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_ms = jetzt_ms();
         let ttl_ms = IN_FLIGHT_TTL.as_millis() as u64;
 
         let mut guard = self.in_flight.lock().unwrap();
-        guard.retain(|_, v| now_ms.saturating_sub(v.started_at_ms) < ttl_ms);
+        guard.retain(|_, v| now_ms.saturating_sub(v.last_activity_ms.max(v.started_at_ms)) < ttl_ms);
 
         let mut entries: Vec<InFlightReq> = guard.values().cloned().collect();
         entries.sort_by_key(|e| e.started_at_ms);
@@ -1271,16 +1283,35 @@ mod tests {
     #[test]
     fn test_inflight_ttl_sweep_removes_old() {
         let sink = sink_with_counters();
-        // Eintrag 20 Minuten alt (ueber 15 Min TTL)
-        let old_ms = Utc::now().timestamp_millis() - (20 * 60 * 1000);
-        sink.emit(started_event("req-old", old_ms));
-        // Eintrag frisch (soeben)
         let now_ms = Utc::now().timestamp_millis();
+        // Ein langer Stream (40 Minuten) bleibt sichtbar, solange er lebt.
+        sink.emit(started_event("req-lang", now_ms - 40 * 60 * 1000));
+        // Ein frischer Eintrag.
         sink.emit(started_event("req-new", now_ms));
+        // Verwaist: kein Lebenszeichen seit ueber 2 h 5 min.
+        sink.emit(started_event("req-old", now_ms - 3 * 60 * 60 * 1000));
+        sink.in_flight.lock().unwrap().get_mut("req-old").unwrap().last_activity_ms =
+            (now_ms - 3 * 60 * 60 * 1000) as u64;
 
-        let snapshot = sink.in_flight_snapshot();
-        assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].request_id, "req-new");
+        let ids: Vec<String> = sink.in_flight_snapshot().into_iter().map(|e| e.request_id).collect();
+        assert_eq!(ids, vec!["req-lang".to_string(), "req-new".to_string()]);
+    }
+
+    #[test]
+    fn test_inflight_progress_keeps_old_stream_alive() {
+        let sink = sink_with_counters();
+        let now_ms = Utc::now().timestamp_millis();
+        sink.emit(started_event("req-1", now_ms - 3 * 60 * 60 * 1000));
+        sink.in_flight.lock().unwrap().get_mut("req-1").unwrap().last_activity_ms = (now_ms - 3 * 60 * 60 * 1000) as u64;
+        // ein zwischenstand ist ein lebenszeichen
+        sink.emit(LiveEvent::Progress {
+            request_id: "req-1".into(),
+            generated_tokens: 10,
+            reasoning_tokens: 0,
+            tokens_exact: false,
+            tokens_per_s: None,
+        });
+        assert_eq!(sink.in_flight_snapshot().len(), 1);
     }
 
     #[test]

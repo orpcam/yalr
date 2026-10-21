@@ -4998,6 +4998,7 @@ mod metrics_tests {
             reasoning_tokens: None,
             tokens_exact: false,
             tokens_per_s: None,
+            last_activity_ms: 0,
         };
         let in_flight = vec![
             mk("a", "p1", "N1"),
@@ -5503,6 +5504,7 @@ yalr_upstream_rate_window_seconds{provider="p"} 2.5
             reasoning_tokens: None,
             tokens_exact: false,
             tokens_per_s: None,
+            last_activity_ms: 0,
         };
 
         let snapshot = vec![mk("a", "key1"), mk("b", "key2"), mk("c", "key1")];
