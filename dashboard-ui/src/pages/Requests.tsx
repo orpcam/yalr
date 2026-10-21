@@ -19,7 +19,8 @@ import { ColumnToggle } from "@/components/ColumnToggle";
 import { ElapsedTimer } from "@/components/ElapsedTimer";
 import { useToast } from "@/components/ui/toast";
 import { ColumnDef, useColumnVisibility } from "@/lib/columns";
-import { tps } from "@/lib/format";
+import { formatTps, tps } from "@/lib/format";
+import { generatedLabel, generatedTitle } from "@/lib/live";
 import { useLanguage, useCurrency } from "@/lib/i18n";
 
 function statusBadge(status: number) {
@@ -39,6 +40,11 @@ interface InFlight {
   firstByteMs: number | null;
   is_redirect?: boolean;
   redirect_to?: string;
+  /** Zwischenstand des Streams (SSE "progress"), null bis zum ersten */
+  generated: number | null;
+  reasoning: number | null;
+  exact: boolean;
+  tokensPerS: number | null;
 }
 
 const PAGE_SIZES = [25, 50, 100, 250];
@@ -116,7 +122,22 @@ export default function Requests() {
         return r.is_stream ? "✓" : "";
       case "prompt_tokens":
         return "–";
-      case "completion_tokens":
+      case "completion_tokens": {
+        const label = generatedLabel(r.generated, r.exact, formatNumber);
+        if (label !== null)
+          return (
+            <span className="font-mono text-xs" title={generatedTitle(r.reasoning, r.exact, t, formatNumber)}>
+              {label}
+            </span>
+          );
+        return r.firstByteMs !== null ? (
+          <span className="text-xs text-muted-foreground">
+            {t("first_token", { ms: formatDuration(r.firstByteMs) })}
+          </span>
+        ) : (
+          <span className="text-xs text-muted-foreground">–</span>
+        );
+      }
       case "total_tokens":
         return r.firstByteMs !== null ? (
           <span className="text-xs text-muted-foreground">
@@ -132,7 +153,7 @@ export default function Requests() {
       case "prefill":
         return "–";
       case "decode":
-        return "–";
+        return r.tokensPerS !== null ? formatTps(r.tokensPerS, locale) : "–";
       case "duration":
         return <ElapsedTimer startedAt={r.startedAt} format={formatDuration} />;
       default:
@@ -331,9 +352,29 @@ export default function Requests() {
           firstByteMs: null,
           is_redirect: ev.is_redirect,
           redirect_to: ev.redirect_to,
+          generated: null,
+          reasoning: null,
+          exact: false,
+          tokensPerS: null,
         },
         ...prev,
       ]);
+    });
+    es.addEventListener("progress", (e) => {
+      const ev = JSON.parse((e as MessageEvent).data) as Extract<LiveEvent, { type: "progress" }>;
+      setInFlight((prev) =>
+        prev.map((r) =>
+          r.request_id === ev.request_id
+            ? {
+                ...r,
+                generated: ev.generated_tokens,
+                reasoning: ev.reasoning_tokens,
+                exact: ev.tokens_exact,
+                tokensPerS: ev.tokens_per_s,
+              }
+            : r
+        )
+      );
     });
     es.addEventListener("first_byte", (e) => {
       const ev = JSON.parse((e as MessageEvent).data) as Extract<LiveEvent, { type: "first_byte" }>;

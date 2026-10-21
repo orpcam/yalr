@@ -33,7 +33,7 @@ import { useToast } from "@/components/ui/toast";
 import { useChartTheme } from "@/lib/chartTheme";
 import { cn } from "@/lib/utils";
 import { formatTps, formatPercent } from "@/lib/format";
-import { completedRates } from "@/lib/live";
+import { completedRates, generatedLabel, generatedTitle } from "@/lib/live";
 import { useLanguage, useCurrency, type TranslationKey } from "@/lib/i18n";
 
 function errorRateClass(rate: number) {
@@ -831,6 +831,23 @@ function LiveRequestRow({
               <span className="shrink-0">
                 {t("running_for", { d: formatDuration(Math.max(0, now - tr.entry.started_at_ms)) })}
               </span>
+              {tr.entry.generated_tokens != null && (
+                <>
+                  <span
+                    className="shrink-0"
+                    title={generatedTitle(tr.entry.reasoning_tokens, tr.entry.tokens_exact, t, formatNumber)}
+                  >
+                    {t("decode_tokens")}:{" "}
+                    <span className="font-mono tabular-nums">
+                      {generatedLabel(tr.entry.generated_tokens, tr.entry.tokens_exact, formatNumber)}
+                    </span>
+                  </span>
+                  <span className="shrink-0">
+                    {t("decode_tps")}:{" "}
+                    <span className="font-mono tabular-nums">{formatTps(tr.entry.tokens_per_s ?? null, locale)}</span>
+                  </span>
+                </>
+              )}
               <span className="ml-auto shrink-0 pl-3 text-muted-foreground">
                 {t("ttft")}:{" "}
                 {tr.entry.first_byte_ms !== null ? formatDuration(tr.entry.first_byte_ms) : t("first_token_pending")}

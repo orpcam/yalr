@@ -323,3 +323,29 @@ export function sampleSegments(
   flush();
   return segments;
 }
+
+/**
+ * Bisher erzeugte Tokens eines laufenden Streams fuer die Anzeige: geschaetzte
+ * Werte mit "≈", null vor dem ersten Zwischenstand.
+ */
+export function generatedLabel(
+  generated: number | null | undefined,
+  exact: boolean | undefined,
+  formatNumber: (v: number) => string,
+): string | null {
+  if (generated == null) return null;
+  return `${exact ? "" : "≈ "}${formatNumber(generated)}`;
+}
+
+/** Tooltip dazu: Anteil Nachdenken und woher die Zahl stammt. */
+export function generatedTitle(
+  reasoning: number | null | undefined,
+  exact: boolean | undefined,
+  t: (key: "generated_reasoning" | "generated_estimated" | "generated_reported", params?: Record<string, string | number>) => string,
+  formatNumber: (v: number) => string,
+): string {
+  const teile: string[] = [];
+  if (reasoning != null && reasoning > 0) teile.push(t("generated_reasoning", { n: formatNumber(reasoning) }));
+  teile.push(t(exact ? "generated_reported" : "generated_estimated"));
+  return teile.join(" · ");
+}

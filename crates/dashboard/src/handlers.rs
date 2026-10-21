@@ -3828,6 +3828,7 @@ pub async fn live_events(
                         .event(match &event {
                             ingest::LiveEvent::RequestStarted { .. } => "request_started",
                             ingest::LiveEvent::FirstByte { .. } => "first_byte",
+                            ingest::LiveEvent::Progress { .. } => "progress",
                             ingest::LiveEvent::Completed { .. } => "completed",
                         })
                         .data(serde_json::to_string(&event).unwrap_or_default()),
@@ -4993,6 +4994,10 @@ mod metrics_tests {
             first_byte_ms: None,
             is_redirect: false,
             redirect_to: String::new(),
+            generated_tokens: None,
+            reasoning_tokens: None,
+            tokens_exact: false,
+            tokens_per_s: None,
         };
         let in_flight = vec![
             mk("a", "p1", "N1"),
@@ -5494,6 +5499,10 @@ yalr_upstream_rate_window_seconds{provider="p"} 2.5
             first_byte_ms: None,
             is_redirect: false,
             redirect_to: String::new(),
+            generated_tokens: None,
+            reasoning_tokens: None,
+            tokens_exact: false,
+            tokens_per_s: None,
         };
 
         let snapshot = vec![mk("a", "key1"), mk("b", "key2"), mk("c", "key1")];

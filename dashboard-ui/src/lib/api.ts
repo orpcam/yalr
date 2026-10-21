@@ -170,6 +170,17 @@ export type LiveEvent =
       redirect_to?: string;
     }
   | { type: "first_byte"; request_id: string; first_byte_ms: number }
+  | {
+      /** Zwischenstand eines laufenden Streams (hoechstens ~1/s je Request). */
+      type: "progress";
+      request_id: string;
+      generated_tokens: number;
+      reasoning_tokens: number;
+      /** true: Zahl vom Anbieter, sonst aus der Textlaenge geschaetzt */
+      tokens_exact: boolean;
+      /** Tokens/s seit dem ersten erzeugten Zeichen (null in der ersten Sekunde) */
+      tokens_per_s: number | null;
+    }
   | { type: "completed"; log: LiveLog };
 
 export interface Stats {
@@ -244,6 +255,12 @@ export interface InFlightRequest {
    *  `model` ist das ANGEFRAGTE Modell, `redirect_to` das Ziel. */
   is_redirect?: boolean;
   redirect_to?: string;
+  /** Bisher erzeugte Tokens (nur Streams, null vor dem ersten Zwischenstand).
+   *  `?` nur als Alt-Daten-Toleranz. */
+  generated_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  tokens_exact?: boolean;
+  tokens_per_s?: number | null;
 }
 
 export interface LiveStats {

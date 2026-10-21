@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   completedRates,
   entryBelongsToRow,
+  generatedLabel,
+  generatedTitle,
   inFlightCountByName,
   orderLiveRows,
   reconcileTracked,
@@ -679,5 +681,28 @@ describe("sampleSegments", () => {
 
   it("returns an empty array for empty input", () => {
     expect(sampleSegments([], 10, 10, 1)).toEqual([]);
+  });
+});
+
+describe("generatedLabel / generatedTitle", () => {
+  const fmt = (v: number) => v.toLocaleString("de-DE");
+  const t = (key: string, params?: Record<string, string | number>) =>
+    params ? `${key}:${Object.values(params).join(",")}` : key;
+
+  it("marks estimates with ≈ and leaves reported counts plain", () => {
+    expect(generatedLabel(1234, false, fmt)).toBe("≈ 1.234");
+    expect(generatedLabel(1234, true, fmt)).toBe("1.234");
+    expect(generatedLabel(0, undefined, fmt)).toBe("≈ 0");
+  });
+
+  it("is null before the first progress update", () => {
+    expect(generatedLabel(null, false, fmt)).toBeNull();
+    expect(generatedLabel(undefined, undefined, fmt)).toBeNull();
+  });
+
+  it("names the reasoning share and the source", () => {
+    expect(generatedTitle(800, false, t, fmt)).toBe("generated_reasoning:800 · generated_estimated");
+    expect(generatedTitle(0, true, t, fmt)).toBe("generated_reported");
+    expect(generatedTitle(null, undefined, t, fmt)).toBe("generated_estimated");
   });
 });

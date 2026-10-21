@@ -126,6 +126,9 @@ const en = {
   no_requests: "No requests in the selected time range.",
   live: "Live",
   first_token: "first token after {ms}",
+  generated_reasoning: "of which {n} reasoning",
+  generated_estimated: "estimated from the text length",
+  generated_reported: "reported by the provider",
   fallback: "Fallback",
   redirect: "Redirect",
 
@@ -429,6 +432,9 @@ const de: Record<TranslationKey, string> = {
   no_requests: "Keine Anfragen im gewählten Zeitraum.",
   live: "Live",
   first_token: "erstes Token nach {ms}",
+  generated_reasoning: "davon {n} Nachdenken",
+  generated_estimated: "aus der Textlänge geschätzt",
+  generated_reported: "vom Anbieter gemeldet",
   fallback: "Fallback",
   redirect: "Redirect",
 

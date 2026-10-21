@@ -17,6 +17,8 @@ use common::state::{AppState, InflightGuard};
 use ingest::{LiveEvent, LiveLog, RequestLog};
 use providers::{compute_cost, estimate_tokens, ProviderError, ProviderKind, RouteTarget};
 
+use crate::progress::StreamProgress;
+
 const MAX_RETRIES: usize = 2;
 /// Text-to-Speech: Anfrage als JSON wie beim Chat, Antwort ist Audio.
 const AUDIO_SPEECH: &str = "/v1/audio/speech";
@@ -1051,6 +1053,8 @@ where
     // log-status wird 502.
     let health = StreamHealth::new();
     let health_map = health.clone();
+    // live-fortschritt: erzeugte tokens mitzaehlen (rohe upstream-events)
+    let mut progress = StreamProgress::new(request_id);
     let stream = bis_zum_ersten_fehler(resp.bytes_stream())
         .map(move |chunk| {
             let chunk = match chunk {
@@ -1060,6 +1064,8 @@ where
                     bytes::Bytes::new()
                 }
             };
+            progress.feed(&chunk);
+            progress.melden(&live_sink);
             // first byte nur bei erstem nicht-leerem chunk (ein leerer
             // chunk aus dem err-zweig darf nicht feuern)
             let mut fb_ms = None;
@@ -1144,6 +1150,8 @@ async fn stream_anthropic_to_openai(
 
     let target_clone = target.clone();
     let model_name = target.model_name.clone();
+    let progress_sink = state.log_sink.clone();
+    let mut progress = StreamProgress::new(request_id);
     tokio::spawn(async move {
         let mut stream = resp.bytes_stream();
         let mut buffer = String::new();
@@ -1182,6 +1190,7 @@ async fn stream_anthropic_to_openai(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                progress.observe(&data);
 
                 // in-band fehler-event: der konverter uebersetzt es nicht
                 // (liefert keinen chunk zurueck), es kommt nie ins
@@ -1224,6 +1233,7 @@ async fn stream_anthropic_to_openai(
                     }
                 }
             }
+            progress.melden(&progress_sink);
         }
         // [DONE] senden (openai-konvention)
         let _ = out_tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
@@ -1305,6 +1315,8 @@ async fn stream_gemini_to_openai(
     let health_task = health.clone();
 
     let model_name = target.model_name.clone();
+    let progress_sink = state.log_sink.clone();
+    let mut progress = StreamProgress::new(request_id);
     tokio::spawn(async move {
         let mut stream = resp.bytes_stream();
         let mut buffer = String::new();
@@ -1342,6 +1354,7 @@ async fn stream_gemini_to_openai(
                     health_task.set_in_band_error(error_event_message(&data));
                     continue;
                 }
+                progress.observe(&data);
                 for openai_chunk in providers::translate::gemini_chunk_to_openai(&data, &model_name) {
                     // auch die uebersetzten chunks fuer das log mitschneiden
                     let _ = log_tx.send(bytes::Bytes::from(format_sse(&openai_chunk))).await;
@@ -1351,6 +1364,7 @@ async fn stream_gemini_to_openai(
                     }
                 }
             }
+            progress.melden(&progress_sink);
         }
         let _ = out_tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
     });
