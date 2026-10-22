@@ -13,6 +13,7 @@ import {
   inFlightCountByName,
   entryBelongsToRow,
   orderLiveRows,
+  processingCount,
   reconcileTracked,
   selectDecodeTps,
   selectPrefillTps,
@@ -287,12 +288,17 @@ export default function Overview() {
   const totalReqs = liveRows.reduce((a, r) => a + r.p.reqs, 0);
   const totalErrors = liveRows.reduce((a, r) => a + r.p.errors, 0);
 
-  // in-flight gesamt: 1s-poll ist quelle der wahrheit; fallback auf running
-  // nur ohne key-filter (provider-metrics kennen keine keys).
+  // in-flight gesamt: 1s-poll ist quelle der wahrheit, abzueglich der requests,
+  // die beim provider noch warten (sonst stehen sie doppelt: in bearbeitung
+  // und wartend); fallback auf running nur ohne key-filter (provider-metrics
+  // kennen keine keys, mit key-filter wird darum auch nichts abgezogen).
   const pollInFlight = liveStats?.in_flight;
+  const queuedByName = keyName
+    ? {}
+    : Object.fromEntries(liveRows.map((r) => [r.p.provider_name, r.p.queued]));
   const totalInFlight =
     pollInFlight && pollInFlight.length > 0
-      ? pollInFlight.length
+      ? processingCount(pollInFlight, queuedByName)
       : keyName
         ? 0
         : liveRows.reduce(

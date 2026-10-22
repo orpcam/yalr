@@ -61,6 +61,26 @@ export function inFlightCountByName(
 }
 
 /**
+ * Anfragen in Bearbeitung: die in-flight-requests (1s-poll) ohne die, die beim
+ * provider noch in der engine-queue warten. Ein wartender request ist fuer
+ * yalr bereits in-flight und steckt zugleich in `queued` des providers — ohne
+ * abzug zaehlt die karte ihn doppelt (z. B. 4 laufend + 1 wartend = "5 in
+ * bearbeitung, 1 wartend"). `queuedByName`: queue-tiefe je provider-instanz-
+ * name, null = provider ohne metrics (dann wird nichts abgezogen).
+ */
+export function processingCount(
+  inFlight: readonly InFlightRequest[],
+  queuedByName: Readonly<Record<string, number | null | undefined>>,
+): number {
+  let total = 0;
+  for (const [name, n] of Object.entries(inFlightCountByName(inFlight))) {
+    const queued = queuedByName[name];
+    total += queued != null && Number.isFinite(queued) ? Math.max(0, n - Math.round(queued)) : n;
+  }
+  return total;
+}
+
+/**
  * Ob ein getrackter request zu einer provider-zeile gehoert. Der Vergleich
  * erfolgt ueber den provider-instanz-namen (`provider_name`), NICHT ueber
  * den kind-slug (`provider`): mehrere provider-instanzen koennen denselben

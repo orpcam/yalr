@@ -6,6 +6,7 @@ import {
   generatedTitle,
   inFlightCountByName,
   orderLiveRows,
+  processingCount,
   reconcileTracked,
   sampleSegments,
   pushSample,
@@ -116,6 +117,27 @@ describe("sumValues", () => {
 
   it("sums multiple values correctly", () => {
     expect(sumValues([10, 20, 30])).toBe(60);
+  });
+});
+
+// --- processingCount ---
+
+describe("processingCount", () => {
+  const five = ["r1", "r2", "r3", "r4", "r5"].map((id) => req({ request_id: id, provider_name: "GLM" }));
+
+  it("does not count requests waiting in the provider queue as processing", () => {
+    // 4 laufend + 1 in der engine-queue: yalr kennt 5 in-flight, der provider meldet 1 wartend
+    expect(processingCount(five, { GLM: 1 })).toBe(4);
+  });
+
+  it("subtracts per provider and never goes below zero", () => {
+    const mixed = [...five, req({ request_id: "r6", provider_name: "RTX 6000" })];
+    expect(processingCount(mixed, { GLM: 2, "RTX 6000": 3 })).toBe(3);
+  });
+
+  it("keeps the in-flight count for providers without queue metrics", () => {
+    expect(processingCount(five, { GLM: null })).toBe(5);
+    expect(processingCount(five, {})).toBe(5);
   });
 });
 
