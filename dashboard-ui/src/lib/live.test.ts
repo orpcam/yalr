@@ -7,6 +7,7 @@ import {
   inFlightCountByName,
   orderLiveRows,
   processingCount,
+  promptTitle,
   reconcileTracked,
   sampleSegments,
   pushSample,
@@ -726,5 +727,11 @@ describe("generatedLabel / generatedTitle", () => {
     expect(generatedTitle(800, false, t, fmt)).toBe("generated_reasoning:800 · generated_estimated");
     expect(generatedTitle(0, true, t, fmt)).toBe("generated_reported");
     expect(generatedTitle(null, undefined, t, fmt)).toBe("generated_estimated");
+  });
+
+  it("names the source of the prefill count", () => {
+    expect(promptTitle(false, t)).toBe("prompt_estimated");
+    expect(promptTitle(undefined, t)).toBe("prompt_estimated");
+    expect(promptTitle(true, t)).toBe("generated_reported");
   });
 });

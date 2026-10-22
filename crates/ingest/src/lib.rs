@@ -130,6 +130,9 @@ pub enum LiveEvent {
         is_redirect: bool,
         /// Redirect-Ziel (effective) bei aktivem Redirect, sonst leer.
         redirect_to: String,
+        /// Prefill-Tokens, aus der Anfrage geschaetzt (der Anbieter meldet die
+        /// genaue Zahl spaeter per `Progress`, falls ueberhaupt).
+        prompt_tokens: u64,
     },
     FirstByte {
         request_id: String,
@@ -146,6 +149,8 @@ pub enum LiveEvent {
         tokens_exact: bool,
         /// Tokens je Sekunde seit dem ersten erzeugten Zeichen (ab 1 s)
         tokens_per_s: Option<f64>,
+        /// Prefill-Tokens, sobald der Anbieter sie im Stream meldet
+        prompt_tokens: Option<u64>,
     },
     Completed {
         log: LiveLog,
@@ -189,6 +194,10 @@ pub struct InFlightReq {
     pub tokens_exact: bool,
     /// Tokens je Sekunde seit dem ersten erzeugten Zeichen.
     pub tokens_per_s: Option<f64>,
+    /// Prefill-Tokens: beim Start aus der Anfrage geschaetzt, spaeter vom Anbieter.
+    pub prompt_tokens: Option<u64>,
+    /// true: `prompt_tokens` vom Anbieter, sonst geschaetzt.
+    pub prompt_tokens_exact: bool,
     /// Letztes Lebenszeichen (epoch ms) – Basis der TTL.
     #[serde(skip)]
     pub last_activity_ms: u64,
@@ -354,6 +363,7 @@ impl LogSink {
                 model,
                 is_redirect,
                 redirect_to,
+                prompt_tokens,
                 ..
             } => {
                 let mut guard = self.in_flight.lock().unwrap();
@@ -373,6 +383,8 @@ impl LogSink {
                         reasoning_tokens: None,
                         tokens_exact: false,
                         tokens_per_s: None,
+                        prompt_tokens: (*prompt_tokens > 0).then_some(*prompt_tokens),
+                        prompt_tokens_exact: false,
                         last_activity_ms: (timestamp.timestamp_millis() as u64).max(jetzt_ms()),
                     },
                 );
@@ -384,13 +396,17 @@ impl LogSink {
                     entry.last_activity_ms = jetzt_ms();
                 }
             }
-            LiveEvent::Progress { request_id, generated_tokens, reasoning_tokens, tokens_exact, tokens_per_s } => {
+            LiveEvent::Progress { request_id, generated_tokens, reasoning_tokens, tokens_exact, tokens_per_s, prompt_tokens } => {
                 let mut guard = self.in_flight.lock().unwrap();
                 if let Some(entry) = guard.get_mut(request_id) {
                     entry.generated_tokens = Some(*generated_tokens);
                     entry.reasoning_tokens = Some(*reasoning_tokens);
                     entry.tokens_exact = *tokens_exact;
                     entry.tokens_per_s = *tokens_per_s;
+                    if let Some(n) = prompt_tokens {
+                        entry.prompt_tokens = Some(*n);
+                        entry.prompt_tokens_exact = true;
+                    }
                     entry.last_activity_ms = jetzt_ms();
                 }
             }
@@ -1135,6 +1151,7 @@ mod tests {
             is_stream: true,
             is_redirect: false,
             redirect_to: String::new(),
+            prompt_tokens: 0,
         }
     }
 
@@ -1213,6 +1230,7 @@ mod tests {
             reasoning_tokens: 80,
             tokens_exact: false,
             tokens_per_s: Some(42.5),
+            prompt_tokens: None,
         });
         // unbekannte request-id: nichts passiert
         sink.emit(LiveEvent::Progress {
@@ -1221,6 +1239,7 @@ mod tests {
             reasoning_tokens: 0,
             tokens_exact: true,
             tokens_per_s: None,
+            prompt_tokens: None,
         });
 
         let snapshot = sink.in_flight_snapshot();
@@ -1229,6 +1248,45 @@ mod tests {
         assert_eq!(snapshot[0].reasoning_tokens, Some(80));
         assert!(!snapshot[0].tokens_exact);
         assert_eq!(snapshot[0].tokens_per_s, Some(42.5));
+    }
+
+    #[test]
+    fn test_inflight_prompt_tokens_estimate_then_reported() {
+        let sink = sink_with_counters();
+        let now_ms = Utc::now().timestamp_millis();
+        let LiveEvent::RequestStarted { request_id, timestamp, key_name, provider, provider_name, model, endpoint, is_stream, is_redirect, redirect_to, .. } =
+            started_event("req-1", now_ms)
+        else {
+            unreachable!()
+        };
+        sink.emit(LiveEvent::RequestStarted {
+            request_id, timestamp, key_name, provider, provider_name, model, endpoint, is_stream, is_redirect, redirect_to,
+            prompt_tokens: 9000,
+        });
+        let e = &sink.in_flight_snapshot()[0];
+        assert_eq!((e.prompt_tokens, e.prompt_tokens_exact), (Some(9000), false));
+        // zwischenstand ohne prompt-zahl laesst die schaetzung stehen
+        sink.emit(LiveEvent::Progress {
+            request_id: "req-1".into(),
+            generated_tokens: 5,
+            reasoning_tokens: 0,
+            tokens_exact: false,
+            tokens_per_s: None,
+            prompt_tokens: None,
+        });
+        let e = &sink.in_flight_snapshot()[0];
+        assert_eq!((e.prompt_tokens, e.prompt_tokens_exact), (Some(9000), false));
+        // der anbieter meldet die genaue zahl
+        sink.emit(LiveEvent::Progress {
+            request_id: "req-1".into(),
+            generated_tokens: 6,
+            reasoning_tokens: 0,
+            tokens_exact: false,
+            tokens_per_s: None,
+            prompt_tokens: Some(8421),
+        });
+        let e = &sink.in_flight_snapshot()[0];
+        assert_eq!((e.prompt_tokens, e.prompt_tokens_exact), (Some(8421), true));
     }
 
     #[test]
@@ -1248,6 +1306,7 @@ mod tests {
             is_stream: true,
             is_redirect: true,
             redirect_to: "B".into(),
+            prompt_tokens: 0,
         });
 
         let snapshot = sink.in_flight_snapshot();
@@ -1310,6 +1369,7 @@ mod tests {
             reasoning_tokens: 0,
             tokens_exact: false,
             tokens_per_s: None,
+            prompt_tokens: None,
         });
         assert_eq!(sink.in_flight_snapshot().len(), 1);
     }

@@ -369,3 +369,11 @@ export function generatedTitle(
   teile.push(t(exact ? "generated_reported" : "generated_estimated"));
   return teile.join(" · ");
 }
+
+/** Tooltip der Prefill-Tokens eines laufenden Requests: woher die Zahl stammt. */
+export function promptTitle(
+  exact: boolean | undefined,
+  t: (key: "generated_reported" | "prompt_estimated") => string,
+): string {
+  return t(exact ? "generated_reported" : "prompt_estimated");
+}

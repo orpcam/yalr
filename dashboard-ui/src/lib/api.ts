@@ -168,6 +168,8 @@ export type LiveEvent =
       is_redirect?: boolean;
       /** Redirect-Ziel ("" bei Nicht-Redirect). `?` nur als Alt-Daten-Toleranz. */
       redirect_to?: string;
+      /** Prefill-Tokens, aus der Anfrage geschaetzt (0 = unbekannt). `?` nur als Alt-Daten-Toleranz. */
+      prompt_tokens?: number;
     }
   | { type: "first_byte"; request_id: string; first_byte_ms: number }
   | {
@@ -180,6 +182,8 @@ export type LiveEvent =
       tokens_exact: boolean;
       /** Tokens/s seit dem ersten erzeugten Zeichen (null in der ersten Sekunde) */
       tokens_per_s: number | null;
+      /** Prefill-Tokens, sobald der Anbieter sie meldet (sonst null). `?` nur als Alt-Daten-Toleranz. */
+      prompt_tokens?: number | null;
     }
   | { type: "completed"; log: LiveLog };
 
@@ -261,6 +265,10 @@ export interface InFlightRequest {
   reasoning_tokens?: number | null;
   tokens_exact?: boolean;
   tokens_per_s?: number | null;
+  /** Prefill-Tokens: beim Start aus der Anfrage geschaetzt, spaeter vom Anbieter
+   *  (`prompt_tokens_exact`). `?` nur als Alt-Daten-Toleranz. */
+  prompt_tokens?: number | null;
+  prompt_tokens_exact?: boolean;
 }
 
 export interface LiveStats {

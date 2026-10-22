@@ -387,6 +387,7 @@ async fn proxy_pipeline(
         } else {
             String::new()
         },
+        prompt_tokens: crate::progress::prompt_schaetzung(&req_json),
     });
 
     // 5) Request gegen Targets ausfuehren (retry + fallback)

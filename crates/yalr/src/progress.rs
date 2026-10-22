@@ -7,6 +7,11 @@
 //! (`usage` im Chunk), gilt sie, sobald sie mindestens so gross ist wie die
 //! Schaetzung; sonst schaetzt der Zaehler wie `estimate_tokens` (4 Bytes je
 //! Token).
+//!
+//! Die Prefill-Tokens (Prompt) schaetzt [`prompt_schaetzung`] schon beim Start
+//! aus der Anfrage; meldet der Anbieter die Zahl im Stream (Anthropic gleich zu
+//! Beginn in `message_start`, OpenAI/vLLM mit `include_usage` im letzten Chunk,
+//! Gemini in `usageMetadata`), geht sie mit dem naechsten Zwischenstand raus.
 
 use std::time::{Duration, Instant};
 
@@ -25,10 +30,13 @@ pub struct StreamProgress {
     reasoning_bytes: u64,
     /// vom Anbieter gemeldete Zahl der erzeugten Tokens (falls vorhanden)
     gemeldet: Option<u64>,
+    /// vom Anbieter gemeldete Zahl der Prefill-Tokens (falls vorhanden)
+    prompt_gemeldet: Option<u64>,
     /// angefangene SSE-Zeile aus dem letzten Byte-Stueck
     zeile: Vec<u8>,
     zuletzt: Option<Instant>,
     zuletzt_tokens: u64,
+    zuletzt_prompt: Option<u64>,
     /// wann das erste erzeugte zeichen kam (basis fuer tokens/s)
     erstes: Option<Instant>,
 }
@@ -40,6 +48,8 @@ pub struct Stand {
     pub reasoning_tokens: u64,
     /// true, wenn `tokens` vom Anbieter stammt (sonst geschaetzt)
     pub exact: bool,
+    /// Prefill-Tokens, sobald der Anbieter sie meldet
+    pub prompt_tokens: Option<u64>,
 }
 
 fn geschaetzt(bytes: u64) -> u64 {
@@ -50,6 +60,28 @@ fn text_len(v: Option<&Value>) -> u64 {
     v.and_then(|t| t.as_str()).map(|s| s.len() as u64).unwrap_or(0)
 }
 
+/// Strings, die keine Prompt-Tokens im ueblichen Sinn sind: Data-URIs und
+/// lange Bloecke ohne Leerraum (Base64 von Bildern, Audio, Dateien).
+fn ist_blob(s: &str) -> bool {
+    s.starts_with("data:") || (s.len() > 512 && !s.bytes().any(|b| b.is_ascii_whitespace()))
+}
+
+fn text_bytes(v: &Value) -> u64 {
+    match v {
+        Value::String(s) if !ist_blob(s) => s.len() as u64,
+        Value::Array(a) => a.iter().map(text_bytes).sum(),
+        Value::Object(o) => o.iter().filter(|(k, _)| k.as_str() != "model").map(|(_, v)| text_bytes(v)).sum(),
+        _ => 0,
+    }
+}
+
+/// Geschaetzte Prefill-Tokens einer Anfrage, bevor der Anbieter etwas meldet:
+/// der Text aller Felder (Nachrichten, System, Werkzeuge) wie `estimate_tokens`
+/// mit 4 Bytes je Token, ohne Feldnamen, Modellnamen und Binaerdaten.
+pub fn prompt_schaetzung(req: &Value) -> u64 {
+    geschaetzt(text_bytes(req))
+}
+
 impl StreamProgress {
     pub fn new(request_id: impl Into<String>) -> Self {
         Self {
@@ -57,9 +89,11 @@ impl StreamProgress {
             bytes: 0,
             reasoning_bytes: 0,
             gemeldet: None,
+            prompt_gemeldet: None,
             zeile: Vec::new(),
             zuletzt: None,
             zuletzt_tokens: 0,
+            zuletzt_prompt: None,
             erstes: None,
         }
     }
@@ -106,6 +140,9 @@ impl StreamProgress {
             if let Some(n) = v.pointer("/usage/completion_tokens").and_then(|n| n.as_u64()) {
                 self.gemeldet = Some(n);
             }
+            if let Some(n) = v.pointer("/usage/prompt_tokens").and_then(|n| n.as_u64()) {
+                self.prompt_gemeldet = Some(n);
+            }
             return;
         }
         // anthropic: content_block_delta / message_delta
@@ -119,9 +156,18 @@ impl StreamProgress {
                     + text_len(d.and_then(|d| d.get("partial_json")));
                 return;
             }
+            Some("message_start") => {
+                if let Some(u) = v.pointer("/message/usage") {
+                    self.anthropic_prompt(u);
+                }
+                return;
+            }
             Some("message_delta") => {
-                if let Some(n) = v.pointer("/usage/output_tokens").and_then(|n| n.as_u64()) {
-                    self.gemeldet = Some(n);
+                if let Some(u) = v.get("usage") {
+                    if let Some(n) = u.get("output_tokens").and_then(|n| n.as_u64()) {
+                        self.gemeldet = Some(n);
+                    }
+                    self.anthropic_prompt(u);
                 }
                 return;
             }
@@ -147,15 +193,29 @@ impl StreamProgress {
             if kandidaten.is_some() || gedanken.is_some() {
                 self.gemeldet = Some(kandidaten.unwrap_or(0) + gedanken.unwrap_or(0));
             }
+            if let Some(n) = u.get("promptTokenCount").and_then(|n| n.as_u64()) {
+                self.prompt_gemeldet = Some(n);
+            }
+        }
+    }
+
+    /// Anthropic zaehlt den Prompt in drei Teilen: neu, aus dem Cache gelesen,
+    /// in den Cache geschrieben – zusammen sind es die Prefill-Tokens.
+    fn anthropic_prompt(&mut self, u: &Value) {
+        let teile = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+            .map(|k| u.get(k).and_then(|n| n.as_u64()));
+        if teile.iter().any(|t| t.is_some()) {
+            self.prompt_gemeldet = Some(teile.iter().map(|t| t.unwrap_or(0)).sum());
         }
     }
 
     pub fn stand(&self) -> Stand {
         let schaetzung = geschaetzt(self.bytes);
         let reasoning_tokens = geschaetzt(self.reasoning_bytes);
+        let prompt_tokens = self.prompt_gemeldet.filter(|n| *n > 0);
         match self.gemeldet {
-            Some(n) if n > 0 && n >= schaetzung => Stand { tokens: n, reasoning_tokens, exact: true },
-            _ => Stand { tokens: schaetzung, reasoning_tokens, exact: false },
+            Some(n) if n > 0 && n >= schaetzung => Stand { tokens: n, reasoning_tokens, exact: true, prompt_tokens },
+            _ => Stand { tokens: schaetzung, reasoning_tokens, exact: false, prompt_tokens },
         }
     }
 
@@ -170,7 +230,7 @@ impl StreamProgress {
         if stand.tokens > 0 && self.erstes.is_none() {
             self.erstes = Some(jetzt);
         }
-        if stand.tokens == self.zuletzt_tokens {
+        if stand.tokens == self.zuletzt_tokens && stand.prompt_tokens == self.zuletzt_prompt {
             return;
         }
         if self.zuletzt.is_some_and(|t| jetzt.duration_since(t) < MELDE_TAKT) {
@@ -178,6 +238,7 @@ impl StreamProgress {
         }
         self.zuletzt = Some(jetzt);
         self.zuletzt_tokens = stand.tokens;
+        self.zuletzt_prompt = stand.prompt_tokens;
         // tokens/s erst ab einer sekunde seit dem ersten zeichen (sonst zu zappelig)
         let tokens_per_s = self.erstes.and_then(|t| {
             let s = jetzt.duration_since(t).as_secs_f64();
@@ -189,6 +250,7 @@ impl StreamProgress {
             reasoning_tokens: stand.reasoning_tokens,
             tokens_exact: stand.exact,
             tokens_per_s,
+            prompt_tokens: stand.prompt_tokens,
         });
     }
 }
@@ -204,9 +266,9 @@ mod tests {
         let a = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"abcdefgh\"}}]}\n\ndata: {\"choi";
         let b = "ces\":[{\"delta\":{\"content\":\"1234\"}}]}\r\n\r\ndata: [DONE]\n\n";
         p.feed(a.as_bytes());
-        assert_eq!(p.stand(), Stand { tokens: 2, reasoning_tokens: 2, exact: false });
+        assert_eq!(p.stand(), Stand { tokens: 2, reasoning_tokens: 2, exact: false, prompt_tokens: None });
         p.feed(b.as_bytes());
-        assert_eq!(p.stand(), Stand { tokens: 3, reasoning_tokens: 2, exact: false });
+        assert_eq!(p.stand(), Stand { tokens: 3, reasoning_tokens: 2, exact: false, prompt_tokens: None });
     }
 
     #[test]
@@ -216,7 +278,7 @@ mod tests {
         assert_eq!(p.stand().tokens, 2);
         // die gemeldete zahl gilt, sobald sie die schaetzung erreicht
         p.observe(&json!({"choices":[],"usage":{"completion_tokens":40}}));
-        assert_eq!(p.stand(), Stand { tokens: 40, reasoning_tokens: 0, exact: true });
+        assert_eq!(p.stand(), Stand { tokens: 40, reasoning_tokens: 0, exact: true, prompt_tokens: None });
     }
 
     #[test]
@@ -224,7 +286,7 @@ mod tests {
         let mut p = StreamProgress::new("r");
         p.observe(&json!({"type":"message_delta","usage":{"output_tokens":1}}));
         p.observe(&json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"x".repeat(40)}}));
-        assert_eq!(p.stand(), Stand { tokens: 10, reasoning_tokens: 0, exact: false });
+        assert_eq!(p.stand(), Stand { tokens: 10, reasoning_tokens: 0, exact: false, prompt_tokens: None });
     }
 
     #[test]
@@ -233,18 +295,69 @@ mod tests {
         p.observe(&json!({"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"12345678"}}));
         p.observe(&json!({"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"x\":"}}));
         p.observe(&json!({"type":"ping"}));
-        assert_eq!(p.stand(), Stand { tokens: 4, reasoning_tokens: 2, exact: false });
+        assert_eq!(p.stand(), Stand { tokens: 4, reasoning_tokens: 2, exact: false, prompt_tokens: None });
         p.observe(&json!({"type":"message_delta","usage":{"output_tokens":12}}));
-        assert_eq!(p.stand(), Stand { tokens: 12, reasoning_tokens: 2, exact: true });
+        assert_eq!(p.stand(), Stand { tokens: 12, reasoning_tokens: 2, exact: true, prompt_tokens: None });
     }
 
     #[test]
     fn gemini_chunks() {
         let mut p = StreamProgress::new("r");
         p.observe(&json!({"candidates":[{"content":{"parts":[{"text":"abcd","thought":true},{"text":"efgh"}]}}]}));
-        assert_eq!(p.stand(), Stand { tokens: 2, reasoning_tokens: 1, exact: false });
+        assert_eq!(p.stand(), Stand { tokens: 2, reasoning_tokens: 1, exact: false, prompt_tokens: None });
         p.observe(&json!({"candidates":[],"usageMetadata":{"candidatesTokenCount":5,"thoughtsTokenCount":3}}));
-        assert_eq!(p.stand(), Stand { tokens: 8, reasoning_tokens: 1, exact: true });
+        assert_eq!(p.stand(), Stand { tokens: 8, reasoning_tokens: 1, exact: true, prompt_tokens: None });
+    }
+
+    #[test]
+    fn prompt_tokens_reported_by_provider() {
+        // anthropic: gleich zu beginn, samt cache-anteilen
+        let mut p = StreamProgress::new("r");
+        p.observe(&json!({"type":"message_start","message":{"usage":{"input_tokens":120,"cache_read_input_tokens":3000,"cache_creation_input_tokens":80,"output_tokens":1}}}));
+        assert_eq!(p.stand().prompt_tokens, Some(3200));
+        // openai/vllm: usage im letzten chunk
+        let mut p = StreamProgress::new("r");
+        p.observe(&json!({"choices":[{"delta":{"content":"ab"}}]}));
+        assert_eq!(p.stand().prompt_tokens, None);
+        p.observe(&json!({"choices":[],"usage":{"prompt_tokens":9000,"completion_tokens":1}}));
+        assert_eq!(p.stand().prompt_tokens, Some(9000));
+        // gemini
+        let mut p = StreamProgress::new("r");
+        p.observe(&json!({"candidates":[],"usageMetadata":{"promptTokenCount":77}}));
+        assert_eq!(p.stand().prompt_tokens, Some(77));
+    }
+
+    #[test]
+    fn prompt_estimate_counts_text_not_blobs() {
+        let bild = "A".repeat(4000);
+        let req = json!({
+            "model": "ein-sehr-langer-modellname",
+            "messages": [
+                {"role": "system", "content": "abcd efgh"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "ijkl"},
+                    {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{bild}")}},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": bild}}
+                ]}
+            ],
+            "max_tokens": 100
+        });
+        // gezaehlt: "system" "abcd efgh" "user" "text" "ijkl" "image_url" "image" "base64" "image/png" = 56 bytes
+        assert_eq!(prompt_schaetzung(&req), 14);
+    }
+
+    #[tokio::test]
+    async fn reports_prompt_tokens_before_output() {
+        let (sink, _handle) = ingest::start(clickhouse::Client::default(), ingest::IngestConfig::default());
+        let mut rx = sink.subscribe();
+        let mut p = StreamProgress::new("r1");
+        let t0 = Instant::now();
+        p.observe(&json!({"type":"message_start","message":{"usage":{"input_tokens":500}}}));
+        p.melden_um(&sink, t0);
+        match rx.try_recv() {
+            Ok(LiveEvent::Progress { generated_tokens, prompt_tokens, .. }) => assert_eq!((generated_tokens, prompt_tokens), (0, Some(500))),
+            other => panic!("erwartet Progress, bekam {other:?}"),
+        }
     }
 
     #[tokio::test]

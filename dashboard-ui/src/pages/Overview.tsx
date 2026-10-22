@@ -34,7 +34,7 @@ import { useToast } from "@/components/ui/toast";
 import { useChartTheme } from "@/lib/chartTheme";
 import { cn } from "@/lib/utils";
 import { formatTps, formatPercent } from "@/lib/format";
-import { completedRates, generatedLabel, generatedTitle } from "@/lib/live";
+import { completedRates, generatedLabel, generatedTitle, promptTitle } from "@/lib/live";
 import { useLanguage, useCurrency, type TranslationKey } from "@/lib/i18n";
 
 function errorRateClass(rate: number) {
@@ -837,6 +837,14 @@ function LiveRequestRow({
               <span className="shrink-0">
                 {t("running_for", { d: formatDuration(Math.max(0, now - tr.entry.started_at_ms)) })}
               </span>
+              {tr.entry.prompt_tokens != null && (
+                <span className="shrink-0" title={promptTitle(tr.entry.prompt_tokens_exact, t)}>
+                  {t("prefill_tokens")}:{" "}
+                  <span className="font-mono tabular-nums">
+                    {generatedLabel(tr.entry.prompt_tokens, tr.entry.prompt_tokens_exact, formatNumber)}
+                  </span>
+                </span>
+              )}
               {tr.entry.generated_tokens != null && (
                 <>
                   <span

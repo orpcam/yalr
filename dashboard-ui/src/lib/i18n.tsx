@@ -129,6 +129,7 @@ const en = {
   generated_reasoning: "of which {n} reasoning",
   generated_estimated: "estimated from the text length",
   generated_reported: "reported by the provider",
+  prompt_estimated: "estimated from the request",
   fallback: "Fallback",
   redirect: "Redirect",
 
@@ -435,6 +436,7 @@ const de: Record<TranslationKey, string> = {
   generated_reasoning: "davon {n} Nachdenken",
   generated_estimated: "aus der Textlänge geschätzt",
   generated_reported: "vom Anbieter gemeldet",
+  prompt_estimated: "aus der Anfrage geschätzt",
   fallback: "Fallback",
   redirect: "Redirect",
 

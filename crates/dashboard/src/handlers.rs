@@ -4998,6 +4998,8 @@ mod metrics_tests {
             reasoning_tokens: None,
             tokens_exact: false,
             tokens_per_s: None,
+            prompt_tokens: None,
+            prompt_tokens_exact: false,
             last_activity_ms: 0,
         };
         let in_flight = vec![
@@ -5504,6 +5506,8 @@ yalr_upstream_rate_window_seconds{provider="p"} 2.5
             reasoning_tokens: None,
             tokens_exact: false,
             tokens_per_s: None,
+            prompt_tokens: None,
+            prompt_tokens_exact: false,
             last_activity_ms: 0,
         };
 

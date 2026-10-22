@@ -20,7 +20,7 @@ import { ElapsedTimer } from "@/components/ElapsedTimer";
 import { useToast } from "@/components/ui/toast";
 import { ColumnDef, useColumnVisibility } from "@/lib/columns";
 import { formatTps, tps } from "@/lib/format";
-import { generatedLabel, generatedTitle } from "@/lib/live";
+import { generatedLabel, generatedTitle, promptTitle } from "@/lib/live";
 import { useLanguage, useCurrency } from "@/lib/i18n";
 
 function statusBadge(status: number) {
@@ -45,6 +45,9 @@ interface InFlight {
   reasoning: number | null;
   exact: boolean;
   tokensPerS: number | null;
+  /** Prefill-Tokens: geschaetzt ab Start, exakt sobald der Anbieter sie meldet */
+  prompt: number | null;
+  promptExact: boolean;
 }
 
 const PAGE_SIZES = [25, 50, 100, 250];
@@ -120,8 +123,16 @@ export default function Requests() {
         );
       case "stream":
         return r.is_stream ? "✓" : "";
-      case "prompt_tokens":
-        return "–";
+      case "prompt_tokens": {
+        const label = generatedLabel(r.prompt, r.promptExact, formatNumber);
+        return label !== null ? (
+          <span className="font-mono text-xs" title={promptTitle(r.promptExact, t)}>
+            {label}
+          </span>
+        ) : (
+          "–"
+        );
+      }
       case "completion_tokens": {
         const label = generatedLabel(r.generated, r.exact, formatNumber);
         if (label !== null)
@@ -356,6 +367,8 @@ export default function Requests() {
           reasoning: null,
           exact: false,
           tokensPerS: null,
+          prompt: ev.prompt_tokens ? ev.prompt_tokens : null,
+          promptExact: false,
         },
         ...prev,
       ]);
@@ -371,6 +384,8 @@ export default function Requests() {
                 reasoning: ev.reasoning_tokens,
                 exact: ev.tokens_exact,
                 tokensPerS: ev.tokens_per_s,
+                // die gemeldete prefill-zahl ersetzt die schaetzung vom start
+                ...(ev.prompt_tokens != null ? { prompt: ev.prompt_tokens, promptExact: true } : {}),
               }
             : r
         )
