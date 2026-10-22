@@ -388,6 +388,7 @@ async fn proxy_pipeline(
             String::new()
         },
         prompt_tokens: crate::progress::prompt_schaetzung(&req_json),
+        config: crate::request_config::request_config(&req_json, &endpoint, primary_target),
     });
 
     // 5) Request gegen Targets ausfuehren (retry + fallback)
@@ -750,6 +751,7 @@ fn audio_stream_log(
         Some(e) => (502, "provider_network".to_string(), e),
         None => (200, String::new(), String::new()),
     };
+    let config = crate::request_config::request_config(req_json, endpoint, Some(target));
     RequestLog {
         id: Uuid::new_v4(),
         request_id: request_id.to_string(),
@@ -780,6 +782,10 @@ fn audio_stream_log(
         is_redirect: routing.is_redirect,
         original_model: routing.requested_model.clone(),
         attempts_made: 1,
+        reasoning_effort: config.reasoning_effort.clone(),
+        request_config: config.als_json(),
+        reasoning_tokens: 0,
+        reasoning_exact: false,
     }
 }
 
@@ -1502,6 +1508,10 @@ fn log_stream_completion(
             target.output_price_per_million,
         );
 
+        // nachdenken und konfiguration fuer live-event und log
+        let (reasoning_tokens, reasoning_exact) = crate::progress::reasoning_aus_antwort(&response_str);
+        let config = crate::request_config::request_config(&req_json, &endpoint, Some(&target));
+
         // in-flight-zähler sofort zuruecksetzen, bevor die teure log-aufbereitung
         // (stream_to_completion_json) laeuft. Das live-dashboard sieht damit den
         // ende-zustand ohne verzögerung. Werte sind identisch zur persistierten
@@ -1533,6 +1543,8 @@ fn log_stream_completion(
                 // Durchreichen wuerde execute_once + alle stream-funktionen
                 // beruehren) -> 0 = unbekannt.
                 attempts_made: 0,
+                reasoning_tokens,
+                reasoning_effort: config.reasoning_effort.clone(),
             },
         });
 
@@ -1575,6 +1587,10 @@ fn log_stream_completion(
             original_model: requested_model,
             // wie im Live-Event: attempt-index hier nicht verfuegbar -> unbekannt
             attempts_made: 0,
+            reasoning_effort: config.reasoning_effort.clone(),
+            request_config: config.als_json(),
+            reasoning_tokens,
+            reasoning_exact,
         };
         if log.cost_usd > 0.0 {
             state.track_spend(vk.id, log.cost_usd);
@@ -2063,6 +2079,7 @@ fn build_log(
     let is_fallback = routing.fallback_used(&target.model_name);
     let is_redirect = routing.is_redirect;
     let attempts_made = (attempt + 1) as u8;
+    let config = crate::request_config::request_config(req_json, endpoint, Some(target));
 
     RequestLog {
         id: Uuid::new_v4(),
@@ -2094,6 +2111,10 @@ fn build_log(
         is_redirect,
         original_model: requested_model,
         attempts_made,
+        reasoning_effort: config.reasoning_effort.clone(),
+        request_config: config.als_json(),
+        reasoning_tokens: outcome.log.reasoning_tokens,
+        reasoning_exact: outcome.log.reasoning_exact,
     }
 }
 
@@ -2121,6 +2142,8 @@ fn build_log_from_response(
         target.input_price_per_million,
         target.output_price_per_million,
     );
+    // nachdenken der antwort; build_log uebernimmt es in das persistierte log
+    let (reasoning_tokens, reasoning_exact) = crate::progress::reasoning_aus_json(resp_json);
     RequestLog {
         id: Uuid::new_v4(),
         request_id: Uuid::new_v4().to_string(),
@@ -2154,6 +2177,10 @@ fn build_log_from_response(
         is_redirect: routing.is_redirect,
         original_model: routing.requested_model.clone(),
         attempts_made: 0,
+        reasoning_effort: String::new(),
+        request_config: String::new(),
+        reasoning_tokens,
+        reasoning_exact,
     }
 }
 
@@ -2188,6 +2215,10 @@ fn empty_log(_state: &AppState, _target: &RouteTarget, _endpoint: &str, _req_jso
         is_redirect: false,
         original_model: String::new(),
         attempts_made: 0,
+        reasoning_effort: String::new(),
+        request_config: String::new(),
+        reasoning_tokens: 0,
+        reasoning_exact: false,
     }
 }
 
@@ -2220,6 +2251,10 @@ async fn error_response(
     // is_redirect kann auch bei Fehlern true sein (toter Redirect: Ziel ohne
     // Route) — is_fallback bleibt hier immer false (kein Target bedient).
     let is_redirect = routing.map(|r| r.is_redirect).unwrap_or(false);
+    // konfiguration auch bei fehlern (z. b. abgelehnte denkstufe), sofern der body json ist
+    let config = serde_json::from_slice::<Value>(req_body)
+        .map(|v| crate::request_config::request_config(&v, endpoint, None))
+        .unwrap_or_default();
     let log = RequestLog {
         id: Uuid::new_v4(),
         request_id: request_id.to_string(),
@@ -2252,6 +2287,10 @@ async fn error_response(
         is_redirect,
         original_model,
         attempts_made,
+        reasoning_effort: config.reasoning_effort.clone(),
+        request_config: config.als_json(),
+        reasoning_tokens: 0,
+        reasoning_exact: false,
     };
     state.log_sink.log(log);
 

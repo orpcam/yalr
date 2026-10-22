@@ -3,13 +3,57 @@
 //! Der Proxy-Hot-Path blockiert dadurch nie auf die Datenbank.
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
+
+fn ist_falsch(b: &bool) -> bool {
+    !*b
+}
+
+fn ist_null(n: &u32) -> bool {
+    *n == 0
+}
+
+/// Konfiguration einer Anfrage, wie sie beim Anbieter ankommt: Denkstufe und
+/// die ueblichen Stellschrauben. Die Denkstufe ist vereinheitlicht ("none",
+/// "low", "medium", "high", "max", "on", "adaptive", "budget 8000" …; leer =
+/// nicht angegeben). `effort_by_gateway`: die Stufe stammt nicht vom Client,
+/// sondern aus den Modell-Faehigkeiten (das Gateway setzt sie selbst).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RequestConfig {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reasoning_effort: String,
+    #[serde(default, skip_serializing_if = "ist_falsch")]
+    pub effort_by_gateway: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    /// Anzahl der mitgeschickten Werkzeuge
+    #[serde(default, skip_serializing_if = "ist_null")]
+    pub tools: u32,
+    /// JSON-Antwort verlangt (`response_format` json_object/json_schema)
+    #[serde(default, skip_serializing_if = "ist_falsch")]
+    pub json_mode: bool,
+}
+
+impl RequestConfig {
+    /// Kompakt als JSON fuer die Log-Spalte (leer, wenn nichts angegeben ist).
+    pub fn als_json(&self) -> String {
+        if *self == Self::default() {
+            String::new()
+        } else {
+            serde_json::to_string(self).unwrap_or_default()
+        }
+    }
+}
 
 /// Ein vollstaendiger Request-Log-Eintrag.
 #[derive(Debug, Clone, Serialize, clickhouse::Row)]
@@ -57,6 +101,15 @@ pub struct RequestLog {
     /// Anzahl der Target-Versuche bis zum bedienenden Target (0 = unbekannt,
     /// z.B. Alt-Daten oder Stream-Pfade ohne Attempt-Kontext).
     pub attempts_made: u8,
+    /// Denkstufe der Anfrage (vereinheitlicht, siehe [`RequestConfig`]); eigene
+    /// Spalte zum Filtern, auch wenn der Request-Body gekuerzt ist.
+    pub reasoning_effort: String,
+    /// Die ganze [`RequestConfig`] als JSON (leer = nichts angegeben).
+    pub request_config: String,
+    /// Davon Nachdenken (in `completion_tokens` enthalten).
+    pub reasoning_tokens: u64,
+    /// true: `reasoning_tokens` vom Anbieter, sonst aus dem Text geschaetzt.
+    pub reasoning_exact: bool,
 }
 
 /// Reduzierter Log-Eintrag fuer Live-Events (ohne Bodies, um Payload klein zu halten).
@@ -83,6 +136,8 @@ pub struct LiveLog {
     pub is_redirect: bool,
     pub original_model: String,
     pub attempts_made: u8,
+    pub reasoning_tokens: u64,
+    pub reasoning_effort: String,
 }
 
 impl From<&RequestLog> for LiveLog {
@@ -109,6 +164,8 @@ impl From<&RequestLog> for LiveLog {
             is_redirect: log.is_redirect,
             original_model: log.original_model.clone(),
             attempts_made: log.attempts_made,
+            reasoning_tokens: log.reasoning_tokens,
+            reasoning_effort: log.reasoning_effort.clone(),
         }
     }
 }
@@ -133,6 +190,8 @@ pub enum LiveEvent {
         /// Prefill-Tokens, aus der Anfrage geschaetzt (der Anbieter meldet die
         /// genaue Zahl spaeter per `Progress`, falls ueberhaupt).
         prompt_tokens: u64,
+        /// Denkstufe und Stellschrauben der Anfrage.
+        config: RequestConfig,
     },
     FirstByte {
         request_id: String,
@@ -151,6 +210,10 @@ pub enum LiveEvent {
         tokens_per_s: Option<f64>,
         /// Prefill-Tokens, sobald der Anbieter sie im Stream meldet
         prompt_tokens: Option<u64>,
+        /// true: `reasoning_tokens` vom Anbieter gemeldet
+        reasoning_exact: bool,
+        /// woran das Modell gerade schreibt: "thinking" oder "answering"
+        phase: Option<String>,
     },
     Completed {
         log: LiveLog,
@@ -198,6 +261,12 @@ pub struct InFlightReq {
     pub prompt_tokens: Option<u64>,
     /// true: `prompt_tokens` vom Anbieter, sonst geschaetzt.
     pub prompt_tokens_exact: bool,
+    /// true: `reasoning_tokens` vom Anbieter, sonst geschaetzt.
+    pub reasoning_exact: bool,
+    /// Woran das Modell gerade schreibt: "thinking" oder "answering" (nur Streams).
+    pub phase: Option<String>,
+    /// Denkstufe und Stellschrauben der Anfrage.
+    pub config: RequestConfig,
     /// Letztes Lebenszeichen (epoch ms) – Basis der TTL.
     #[serde(skip)]
     pub last_activity_ms: u64,
@@ -364,6 +433,7 @@ impl LogSink {
                 is_redirect,
                 redirect_to,
                 prompt_tokens,
+                config,
                 ..
             } => {
                 let mut guard = self.in_flight.lock().unwrap();
@@ -385,6 +455,9 @@ impl LogSink {
                         tokens_per_s: None,
                         prompt_tokens: (*prompt_tokens > 0).then_some(*prompt_tokens),
                         prompt_tokens_exact: false,
+                        reasoning_exact: false,
+                        phase: None,
+                        config: config.clone(),
                         last_activity_ms: (timestamp.timestamp_millis() as u64).max(jetzt_ms()),
                     },
                 );
@@ -396,11 +469,24 @@ impl LogSink {
                     entry.last_activity_ms = jetzt_ms();
                 }
             }
-            LiveEvent::Progress { request_id, generated_tokens, reasoning_tokens, tokens_exact, tokens_per_s, prompt_tokens } => {
+            LiveEvent::Progress {
+                request_id,
+                generated_tokens,
+                reasoning_tokens,
+                tokens_exact,
+                tokens_per_s,
+                prompt_tokens,
+                reasoning_exact,
+                phase,
+            } => {
                 let mut guard = self.in_flight.lock().unwrap();
                 if let Some(entry) = guard.get_mut(request_id) {
                     entry.generated_tokens = Some(*generated_tokens);
                     entry.reasoning_tokens = Some(*reasoning_tokens);
+                    entry.reasoning_exact = *reasoning_exact;
+                    if phase.is_some() {
+                        entry.phase = phase.clone();
+                    }
                     entry.tokens_exact = *tokens_exact;
                     entry.tokens_per_s = *tokens_per_s;
                     if let Some(n) = prompt_tokens {
@@ -674,7 +760,11 @@ pub async fn ensure_schema(client: &clickhouse::Client) -> anyhow::Result<()> {
                 is_redirect       Bool DEFAULT false,
                 original_model    LowCardinality(String) DEFAULT '',
                 attempts_made     UInt8 DEFAULT 0,
-                provider_id   Nullable(UUID)
+                provider_id   Nullable(UUID),
+                reasoning_effort  LowCardinality(String) DEFAULT '',
+                request_config    String DEFAULT '',
+                reasoning_tokens  UInt64 DEFAULT 0,
+                reasoning_exact   Bool DEFAULT false
             )
             ENGINE = MergeTree
             PARTITION BY toYYYYMM(timestamp)
@@ -716,6 +806,17 @@ pub async fn ensure_schema(client: &clickhouse::Client) -> anyhow::Result<()> {
         .query("ALTER TABLE yalr.request_logs ADD COLUMN IF NOT EXISTS attempts_made UInt8 DEFAULT 0")
         .execute()
         .await?;
+    for spalte in [
+        "reasoning_effort LowCardinality(String) DEFAULT ''",
+        "request_config String DEFAULT ''",
+        "reasoning_tokens UInt64 DEFAULT 0",
+        "reasoning_exact Bool DEFAULT false",
+    ] {
+        client
+            .query(&format!("ALTER TABLE yalr.request_logs ADD COLUMN IF NOT EXISTS {spalte}"))
+            .execute()
+            .await?;
+    }
     Ok(())
 }
 
@@ -766,6 +867,10 @@ mod tests {
             is_redirect: false,
             original_model: "gpt-4o".into(),
             attempts_made: 1,
+            reasoning_effort: String::new(),
+            request_config: String::new(),
+            reasoning_tokens: 0,
+            reasoning_exact: false,
         };
         sink.log(entry);
         assert!(rx.try_recv().is_ok());
@@ -803,6 +908,10 @@ mod tests {
             is_redirect: false,
             original_model: String::new(),
             attempts_made: 0,
+            reasoning_effort: String::new(),
+            request_config: String::new(),
+            reasoning_tokens: 0,
+            reasoning_exact: false,
         };
 
         let truncated = truncate_bodies(entry, 60);
@@ -852,6 +961,10 @@ mod tests {
             is_redirect: false,
             original_model: String::new(),
             attempts_made: 0,
+            reasoning_effort: String::new(),
+            request_config: String::new(),
+            reasoning_tokens: 0,
+            reasoning_exact: false,
         };
         let truncated = truncate_bodies(entry, 7);
         assert!(truncated.request_truncated);
@@ -891,6 +1004,10 @@ mod tests {
             is_redirect: false,
             original_model: String::new(),
             attempts_made: 0,
+            reasoning_effort: String::new(),
+            request_config: String::new(),
+            reasoning_tokens: 0,
+            reasoning_exact: false,
         }
     }
 
@@ -1152,6 +1269,7 @@ mod tests {
             is_redirect: false,
             redirect_to: String::new(),
             prompt_tokens: 0,
+            config: RequestConfig::default(),
         }
     }
 
@@ -1186,6 +1304,8 @@ mod tests {
                 is_redirect: false,
                 original_model: "gpt-4o".into(),
                 attempts_made: 1,
+                reasoning_effort: String::new(),
+                reasoning_tokens: 0,
             },
         }
     }
@@ -1231,6 +1351,8 @@ mod tests {
             tokens_exact: false,
             tokens_per_s: Some(42.5),
             prompt_tokens: None,
+            reasoning_exact: false,
+            phase: None,
         });
         // unbekannte request-id: nichts passiert
         sink.emit(LiveEvent::Progress {
@@ -1240,6 +1362,8 @@ mod tests {
             tokens_exact: true,
             tokens_per_s: None,
             prompt_tokens: None,
+            reasoning_exact: false,
+            phase: None,
         });
 
         let snapshot = sink.in_flight_snapshot();
@@ -1262,6 +1386,7 @@ mod tests {
         sink.emit(LiveEvent::RequestStarted {
             request_id, timestamp, key_name, provider, provider_name, model, endpoint, is_stream, is_redirect, redirect_to,
             prompt_tokens: 9000,
+            config: RequestConfig::default(),
         });
         let e = &sink.in_flight_snapshot()[0];
         assert_eq!((e.prompt_tokens, e.prompt_tokens_exact), (Some(9000), false));
@@ -1273,6 +1398,8 @@ mod tests {
             tokens_exact: false,
             tokens_per_s: None,
             prompt_tokens: None,
+            reasoning_exact: false,
+            phase: None,
         });
         let e = &sink.in_flight_snapshot()[0];
         assert_eq!((e.prompt_tokens, e.prompt_tokens_exact), (Some(9000), false));
@@ -1284,6 +1411,8 @@ mod tests {
             tokens_exact: false,
             tokens_per_s: None,
             prompt_tokens: Some(8421),
+            reasoning_exact: false,
+            phase: None,
         });
         let e = &sink.in_flight_snapshot()[0];
         assert_eq!((e.prompt_tokens, e.prompt_tokens_exact), (Some(8421), true));
@@ -1307,6 +1436,7 @@ mod tests {
             is_redirect: true,
             redirect_to: "B".into(),
             prompt_tokens: 0,
+            config: RequestConfig::default(),
         });
 
         let snapshot = sink.in_flight_snapshot();
@@ -1370,6 +1500,8 @@ mod tests {
             tokens_exact: false,
             tokens_per_s: None,
             prompt_tokens: None,
+            reasoning_exact: false,
+            phase: None,
         });
         assert_eq!(sink.in_flight_snapshot().len(), 1);
     }

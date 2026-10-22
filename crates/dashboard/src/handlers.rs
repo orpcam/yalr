@@ -2201,6 +2201,26 @@ pub struct LogsQuery {
     pub hours: Option<u32>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    /// Denkstufe (`reasoning_effort`); `_` = ohne Angabe
+    pub effort: Option<String>,
+}
+
+/// Effort-Filter: `_` steht fuer "ohne Angabe" (leere Spalte).
+fn effort_filter(q: &LogsQuery) -> Option<String> {
+    match q.effort.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some("_") => Some(String::new()),
+        Some(e) => Some(e.to_string()),
+    }
+}
+
+/// Die Konfigurations-Spalte als JSON-Objekt (null, wenn leer oder kaputt).
+fn config_json(s: &str) -> serde_json::Value {
+    if s.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
+    }
 }
 
 pub async fn list_logs(
@@ -2235,6 +2255,10 @@ pub async fn list_logs(
     if q.status.is_some() {
         where_clauses.push("status = ?".to_string());
     }
+    let effort = effort_filter(&q);
+    if effort.is_some() {
+        where_clauses.push("reasoning_effort = ?".to_string());
+    }
 
     let where_sql = where_clauses.join(" AND ");
 
@@ -2242,7 +2266,8 @@ pub async fn list_logs(
         r#"
         SELECT id, request_id, timestamp, key_name, provider, provider_name, provider_id,
                model, original_model, attempts_made, is_fallback, is_redirect, upstream_model, endpoint, status, error_type, is_stream,
-               prompt_tokens, completion_tokens, cost_usd, duration_ms, first_byte_ms
+               prompt_tokens, completion_tokens, cost_usd, duration_ms, first_byte_ms,
+               reasoning_effort, request_config, reasoning_tokens, reasoning_exact
         FROM yalr.request_logs
         WHERE {where_sql}
         ORDER BY timestamp DESC
@@ -2274,6 +2299,9 @@ pub async fn list_logs(
     if let Some(status) = &q.status {
         query = query.bind(status);
     }
+    if let Some(e) = &effort {
+        query = query.bind(e.clone());
+    }
 
     let mut count_query = state.ch.query(&count_sql).bind(hours);
     if let Some(key) = &q.key_name {
@@ -2288,6 +2316,22 @@ pub async fn list_logs(
     if let Some(status) = &q.status {
         count_query = count_query.bind(status);
     }
+    if let Some(e) = &effort {
+        count_query = count_query.bind(e.clone());
+    }
+
+    // alle denkstufen im zeitraum (fuer den filter, unabhaengig von den anderen filtern)
+    let efforts: Vec<String> = state
+        .ch
+        .query(
+            "SELECT DISTINCT reasoning_effort FROM yalr.request_logs \
+             WHERE timestamp >= now() - INTERVAL ? HOUR AND reasoning_effort != '' \
+             ORDER BY reasoning_effort LIMIT 50",
+        )
+        .bind(hours)
+        .fetch_all::<String>()
+        .await
+        .unwrap_or_default();
 
     #[derive(clickhouse::Row, serde::Serialize, serde::Deserialize)]
     struct LogRow {
@@ -2316,6 +2360,10 @@ pub async fn list_logs(
         cost_usd: f64,
         duration_ms: u64,
         first_byte_ms: u64,
+        reasoning_effort: String,
+        request_config: String,
+        reasoning_tokens: u64,
+        reasoning_exact: bool,
     }
 
     let total: u64 = match count_query.fetch_one::<u64>().await {
@@ -2360,10 +2408,14 @@ pub async fn list_logs(
                         "cost_usd": r.cost_usd,
                         "duration_ms": r.duration_ms,
                         "first_byte_ms": r.first_byte_ms,
+                        "reasoning_effort": r.reasoning_effort,
+                        "request_config": config_json(&r.request_config),
+                        "reasoning_tokens": r.reasoning_tokens,
+                        "reasoning_exact": r.reasoning_exact,
                     })
                 })
                 .collect();
-            Json(json!({ "logs": logs, "total": total })).into_response()
+            Json(json!({ "logs": logs, "total": total, "efforts": efforts })).into_response()
         }
         Err(e) => {
             tracing::error!("clickhouse query failed: {e}");
@@ -2417,6 +2469,10 @@ pub async fn get_log(
         response_body: String,
         request_truncated: bool,
         response_truncated: bool,
+        reasoning_effort: String,
+        request_config: String,
+        reasoning_tokens: u64,
+        reasoning_exact: bool,
     }
 
     let provider_names = current_provider_names(&state).await;
@@ -2428,7 +2484,8 @@ pub async fn get_log(
                    model, original_model, attempts_made, is_fallback, is_redirect, upstream_model, endpoint, status, error_message, error_type,
                    is_stream, prompt_tokens, completion_tokens, cost_usd,
                    duration_ms, first_byte_ms, request_body, response_body,
-                   request_truncated, response_truncated
+                   request_truncated, response_truncated,
+                   reasoning_effort, request_config, reasoning_tokens, reasoning_exact
             FROM yalr.request_logs WHERE id = ? OR request_id = ?
             ORDER BY timestamp DESC
             LIMIT 1
@@ -2444,6 +2501,9 @@ pub async fn get_log(
     match result {
         Ok(row) => {
             let mut value = serde_json::to_value(&row).unwrap_or_default();
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("request_config".to_string(), config_json(&row.request_config));
+            }
             if let Some(pid) = row.provider_id {
                 if let Some(name) = provider_names.get(&pid) {
                     if let Some(obj) = value.as_object_mut() {
@@ -2813,23 +2873,30 @@ pub async fn breakdown(
         Ok(r) => r,
         Err(msg) => return bad_request(msg),
     };
-    // group_col: einzelne spalte | model_provider: kombi aus beiden feldern
-    let (group_col, with_provider) = match q.group_by.as_deref() {
-        Some("provider") => ("provider", false),
-        Some("model") => ("model", false),
-        Some("model_provider") => ("model", true),
-        _ => ("key_name", false),
+    // group_col: einzelne spalte | model_provider: kombi aus beiden feldern |
+    // model_provider_effort: dazu die denkstufe (vergleich high gegen max)
+    let (group_col, with_provider, with_effort) = match q.group_by.as_deref() {
+        Some("provider") => ("provider", false, false),
+        Some("model") => ("model", false, false),
+        Some("model_provider") => ("model", true, false),
+        Some("model_provider_effort") => ("model", true, true),
+        _ => ("key_name", false, false),
     };
+    let effort_col = if with_effort { "reasoning_effort" } else { "''" };
 
     #[derive(clickhouse::Row, serde::Serialize, serde::Deserialize)]
     struct GroupRow {
         group_name: String,
         provider_name: String,
+        effort: String,
         #[serde(with = "clickhouse::serde::uuid::option")]
         provider_id: Option<Uuid>,
         requests: u64,
         cost: f64,
         tokens: u64,
+        completion: u64,
+        reasoning: u64,
+        duration_sum: u64,
     }
 
     let mut where_clauses: Vec<String> = Vec::new();
@@ -2851,13 +2918,17 @@ pub async fn breakdown(
             SELECT
                 {group_col} AS group_name,
                 provider_name AS provider_name,
+                {effort_col} AS effort,
                 any(provider_id) AS provider_id,
                 count() AS requests,
                 sum(cost_usd) AS cost,
-                sum(prompt_tokens + completion_tokens) AS tokens
+                sum(prompt_tokens + completion_tokens) AS tokens,
+                sum(completion_tokens) AS completion,
+                sum(reasoning_tokens) AS reasoning,
+                sum(duration_ms) AS duration_sum
             FROM yalr.request_logs
             {where_sql}
-            GROUP BY group_name, provider_name
+            GROUP BY group_name, provider_name, effort
             ORDER BY cost DESC
             LIMIT 100
             "#
@@ -2868,10 +2939,14 @@ pub async fn breakdown(
             SELECT
                 {group_col} AS group_name,
                 '' AS provider_name,
+                '' AS effort,
                 NULL AS provider_id,
                 count() AS requests,
                 sum(cost_usd) AS cost,
-                sum(prompt_tokens + completion_tokens) AS tokens
+                sum(prompt_tokens + completion_tokens) AS tokens,
+                sum(completion_tokens) AS completion,
+                sum(reasoning_tokens) AS reasoning,
+                sum(duration_ms) AS duration_sum
             FROM yalr.request_logs
             {where_sql}
             GROUP BY group_name
@@ -2902,22 +2977,33 @@ pub async fn breakdown(
                     .and_then(|id| provider_names.get(&id).cloned())
                     .unwrap_or_else(|| r.provider_name.clone());
                 match items.iter_mut().find(|it| {
-                    it["group"] == r.group_name.as_str() && it["provider_name"] == name.as_str()
+                    it["group"] == r.group_name.as_str()
+                        && it["provider_name"] == name.as_str()
+                        && it["effort"] == r.effort.as_str()
                 }) {
                     Some(existing) => {
-                        let prev_req = existing["requests"].as_u64().unwrap_or(0);
+                        for (k, v) in [
+                            ("requests", r.requests),
+                            ("tokens", r.tokens),
+                            ("completion_tokens", r.completion),
+                            ("reasoning_tokens", r.reasoning),
+                            ("duration_sum_ms", r.duration_sum),
+                        ] {
+                            existing[k] = json!(existing[k].as_u64().unwrap_or(0) + v);
+                        }
                         let prev_cost = existing["cost"].as_f64().unwrap_or(0.0);
-                        let prev_tokens = existing["tokens"].as_u64().unwrap_or(0);
-                        existing["requests"] = json!(prev_req + r.requests);
                         existing["cost"] = json!(prev_cost + r.cost);
-                        existing["tokens"] = json!(prev_tokens + r.tokens);
                     }
                     None => items.push(json!({
                         "group": r.group_name,
                         "provider_name": name,
+                        "effort": r.effort,
                         "requests": r.requests,
                         "cost": r.cost,
                         "tokens": r.tokens,
+                        "completion_tokens": r.completion,
+                        "reasoning_tokens": r.reasoning,
+                        "duration_sum_ms": r.duration_sum,
                     })),
                 }
             }
@@ -5000,6 +5086,9 @@ mod metrics_tests {
             tokens_per_s: None,
             prompt_tokens: None,
             prompt_tokens_exact: false,
+            reasoning_exact: false,
+            phase: None,
+            config: ingest::RequestConfig::default(),
             last_activity_ms: 0,
         };
         let in_flight = vec![
@@ -5508,6 +5597,9 @@ yalr_upstream_rate_window_seconds{provider="p"} 2.5
             tokens_per_s: None,
             prompt_tokens: None,
             prompt_tokens_exact: false,
+            reasoning_exact: false,
+            phase: None,
+            config: ingest::RequestConfig::default(),
             last_activity_ms: 0,
         };
 

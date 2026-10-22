@@ -8,6 +8,9 @@ import {
   orderLiveRows,
   processingCount,
   promptTitle,
+  configParts,
+  effortLabel,
+  reasoningShare,
   reconcileTracked,
   sampleSegments,
   pushSample,
@@ -733,5 +736,35 @@ describe("generatedLabel / generatedTitle", () => {
     expect(promptTitle(false, t)).toBe("prompt_estimated");
     expect(promptTitle(undefined, t)).toBe("prompt_estimated");
     expect(promptTitle(true, t)).toBe("generated_reported");
+  });
+});
+
+describe("effortLabel / configParts / reasoningShare", () => {
+  const fmt = (v: number) => v.toLocaleString("de-DE");
+  const t = (key: string, params?: Record<string, string | number>) =>
+    params ? `${key}:${Object.values(params).join(",")}` : key;
+
+  it("shows the effort and marks the one set by the gateway", () => {
+    expect(effortLabel({ reasoning_effort: "high" }, t)).toBe("high");
+    expect(effortLabel({ reasoning_effort: "high", effort_by_gateway: true }, t)).toBe("high (effort_by_gateway)");
+    expect(effortLabel({}, t)).toBeNull();
+    expect(effortLabel(null, t)).toBeNull();
+  });
+
+  it("lists the remaining settings in a fixed order", () => {
+    expect(
+      configParts({ reasoning_effort: "max", temperature: 0.7, top_p: 0.9, max_tokens: 32000, tools: 2, json_mode: true }, t, fmt),
+    ).toEqual(["config_temperature:0,7", "config_top_p:0,9", "config_max_tokens:32.000", "config_tools:2", "config_json"]);
+    expect(configParts({ temperature: 0 }, t, fmt)).toEqual(["config_temperature:0"]);
+    expect(configParts({ reasoning_effort: "low" }, t, fmt)).toEqual([]);
+    expect(configParts(undefined, t, fmt)).toEqual([]);
+  });
+
+  it("computes the reasoning share of the generated tokens", () => {
+    expect(reasoningShare(750, 1000)).toBe(0.75);
+    expect(reasoningShare(1200, 1000)).toBe(1);
+    expect(reasoningShare(0, 1000)).toBeNull();
+    expect(reasoningShare(10, 0)).toBeNull();
+    expect(reasoningShare(undefined, undefined)).toBeNull();
   });
 });

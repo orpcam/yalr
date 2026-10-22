@@ -8,6 +8,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useToast } from "@/components/ui/toast";
 import { copyText } from "@/lib/clipboard";
 import { extractRequestText, extractStreamText, prettyJson } from "@/lib/logText";
+import { configParts, effortLabel } from "@/lib/live";
 import { useLanguage, useCurrency } from "@/lib/i18n";
 
 interface LogDetail extends LogEntry {
@@ -23,7 +24,7 @@ export default function RequestDetail() {
   const [log, setLog] = useState<LogDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showText, setShowText] = useState(true);
-  const { t, formatDateTime, formatDuration } = useLanguage();
+  const { t, formatDateTime, formatDuration, formatNumber } = useLanguage();
   const toast = useToast();
   const { formatCost } = useCurrency();
 
@@ -181,6 +182,30 @@ export default function RequestDetail() {
           </CardHeader>
           <CardContent className="font-medium">
             {t("tokens_in_out", { in: log.prompt_tokens, out: log.completion_tokens })}
+            {(log.reasoning_tokens ?? 0) > 0 && (
+              <span
+                className="block text-sm font-normal text-muted-foreground"
+                title={t(log.reasoning_exact ? "generated_reported" : "generated_estimated")}
+              >
+                {t("generated_reasoning", { n: `${log.reasoning_exact ? "" : "≈ "}${formatNumber(log.reasoning_tokens ?? 0)}` })}
+              </span>
+            )}
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm text-muted-foreground">{t("reasoning_effort")}</CardTitle>
+          </CardHeader>
+          <CardContent className="font-medium">
+            {effortLabel(log.request_config ?? { reasoning_effort: log.reasoning_effort }, t) ?? t("effort_unset")}
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm text-muted-foreground">{t("config")}</CardTitle>
+          </CardHeader>
+          <CardContent className="font-medium">
+            {configParts(log.request_config, t, formatNumber).join(" · ") || "–"}
           </CardContent>
         </Card>
         <Card>

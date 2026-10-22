@@ -118,6 +118,20 @@ export interface Redirect {
   target_has_route: boolean;
 }
 
+/** Denkstufe und Stellschrauben einer Anfrage (vom Gateway ausgelesen). */
+export interface RequestConfig {
+  /** vereinheitlicht: none/low/medium/high/max, on, adaptive, "budget 8000" … */
+  reasoning_effort?: string;
+  /** true: die Stufe hat das Gateway aus den Modell-Faehigkeiten gesetzt */
+  effort_by_gateway?: boolean;
+  temperature?: number;
+  top_p?: number;
+  max_tokens?: number;
+  /** Anzahl mitgeschickter Werkzeuge */
+  tools?: number;
+  json_mode?: boolean;
+}
+
 export interface LogEntry {
   id: string;
   request_id: string;
@@ -143,6 +157,12 @@ export interface LogEntry {
   attempts_made?: number;
   /** Redirect-Info — optional: Alt-Daten haben das Feld nicht */
   is_redirect?: boolean;
+  /** Denkstufe ("" = ohne Angabe) und Konfiguration — optional: Alt-Daten haben sie nicht */
+  reasoning_effort?: string;
+  request_config?: RequestConfig | null;
+  /** davon Nachdenken (in completion_tokens enthalten) */
+  reasoning_tokens?: number;
+  reasoning_exact?: boolean;
 }
 
 // ===== Live-Events (SSE /dashboard-api/live) =====
@@ -150,6 +170,9 @@ export interface LogEntry {
 export interface LiveLog extends LogEntry {
   error_message?: string;
 }
+
+/** Phase eines laufenden Streams: denkt nach / schreibt die Antwort. */
+export type StreamPhase = "thinking" | "answering";
 
 export type LiveEvent =
   | {
@@ -170,6 +193,8 @@ export type LiveEvent =
       redirect_to?: string;
       /** Prefill-Tokens, aus der Anfrage geschaetzt (0 = unbekannt). `?` nur als Alt-Daten-Toleranz. */
       prompt_tokens?: number;
+      /** Denkstufe und Stellschrauben. `?` nur als Alt-Daten-Toleranz. */
+      config?: RequestConfig;
     }
   | { type: "first_byte"; request_id: string; first_byte_ms: number }
   | {
@@ -184,6 +209,10 @@ export type LiveEvent =
       tokens_per_s: number | null;
       /** Prefill-Tokens, sobald der Anbieter sie meldet (sonst null). `?` nur als Alt-Daten-Toleranz. */
       prompt_tokens?: number | null;
+      /** true: reasoning_tokens vom Anbieter gemeldet */
+      reasoning_exact?: boolean;
+      /** woran das Modell gerade schreibt */
+      phase?: StreamPhase | null;
     }
   | { type: "completed"; log: LiveLog };
 
@@ -215,9 +244,14 @@ export interface TimeseriesPoint {
 export interface BreakdownItem {
   group: string;
   provider_name?: string | null;
+  /** Denkstufe (nur bei group_by=model_provider_effort; "" = ohne Angabe) */
+  effort?: string;
   requests: number;
   cost: number;
   tokens: number;
+  completion_tokens?: number;
+  reasoning_tokens?: number;
+  duration_sum_ms?: number;
 }
 
 // ===== Live Provider Stats (/dashboard-api/live/stats) =====
@@ -269,6 +303,9 @@ export interface InFlightRequest {
    *  (`prompt_tokens_exact`). `?` nur als Alt-Daten-Toleranz. */
   prompt_tokens?: number | null;
   prompt_tokens_exact?: boolean;
+  reasoning_exact?: boolean;
+  phase?: StreamPhase | null;
+  config?: RequestConfig;
 }
 
 export interface LiveStats {

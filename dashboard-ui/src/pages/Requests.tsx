@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, LogEntry, VirtualKey, LiveEvent } from "@/lib/api";
+import { api, LogEntry, VirtualKey, LiveEvent, RequestConfig, StreamPhase } from "@/lib/api";
 import { ArrowRightLeft } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -20,7 +20,7 @@ import { ElapsedTimer } from "@/components/ElapsedTimer";
 import { useToast } from "@/components/ui/toast";
 import { ColumnDef, useColumnVisibility } from "@/lib/columns";
 import { formatTps, tps } from "@/lib/format";
-import { generatedLabel, generatedTitle, promptTitle } from "@/lib/live";
+import { configParts, effortLabel, generatedLabel, generatedTitle, promptTitle } from "@/lib/live";
 import { useLanguage, useCurrency } from "@/lib/i18n";
 
 function statusBadge(status: number) {
@@ -48,6 +48,11 @@ interface InFlight {
   /** Prefill-Tokens: geschaetzt ab Start, exakt sobald der Anbieter sie meldet */
   prompt: number | null;
   promptExact: boolean;
+  reasoningExact: boolean;
+  /** woran das Modell gerade schreibt (null vor den ersten Daten) */
+  phase: StreamPhase | null;
+  /** Denkstufe und Stellschrauben der Anfrage */
+  config?: RequestConfig;
 }
 
 const PAGE_SIZES = [25, 50, 100, 250];
@@ -63,6 +68,9 @@ export default function Requests() {
   const [provider, setProvider] = useState("");
   const [model, setModel] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
+  // denkstufe ("" = alle, "_" = ohne angabe) und die im zeitraum vorkommenden stufen
+  const [effort, setEffort] = useState("");
+  const [efforts, setEfforts] = useState<string[]>([]);
   const [hours, setHours] = useState(24);
   const [live, setLive] = useState(true);
   const [inFlight, setInFlight] = useState<InFlight[]>([]);
@@ -74,15 +82,15 @@ export default function Requests() {
   const { t, formatDateTime, formatNumber, formatDuration, locale } = useLanguage();
   const { formatCost } = useCurrency();
   const toast = useToast();
-  const filtersRef = useRef({ keyName, provider, model, statusFilter, hours });
+  const filtersRef = useRef({ keyName, provider, model, statusFilter, effort, hours });
   const pageRef = useRef(page);
   const pageSizeRef = useRef(pageSize);
 
   // latest-refs: der SSE-handler liest filter/page/page-size, ohne bei jeder
   // aenderung die verbindung neu aufbauen zu muessen
   useEffect(() => {
-    filtersRef.current = { keyName, provider, model, statusFilter, hours };
-  }, [keyName, provider, model, statusFilter, hours]);
+    filtersRef.current = { keyName, provider, model, statusFilter, effort, hours };
+  }, [keyName, provider, model, statusFilter, effort, hours]);
   useEffect(() => {
     pageRef.current = page;
   }, [page]);
@@ -167,6 +175,36 @@ export default function Requests() {
         return r.tokensPerS !== null ? formatTps(r.tokensPerS, locale) : "–";
       case "duration":
         return <ElapsedTimer startedAt={r.startedAt} format={formatDuration} />;
+      case "effort": {
+        const stufe = effortLabel(r.config, t);
+        const rest = configParts(r.config, t, formatNumber).join(" · ");
+        return stufe || rest ? (
+          <span className="text-xs" title={rest || undefined}>
+            {stufe ?? "–"}
+          </span>
+        ) : (
+          "–"
+        );
+      }
+      case "reasoning":
+        return (r.reasoning ?? 0) > 0 ? (
+          <span className="inline-flex items-center gap-1.5">
+            <span className="font-mono text-xs" title={t(r.reasoningExact ? "generated_reported" : "generated_estimated")}>
+              {generatedLabel(r.reasoning, r.reasoningExact, formatNumber)}
+            </span>
+            {r.phase === "thinking" && (
+              <Badge variant="outline" className="whitespace-nowrap border-violet-500 text-violet-500">
+                {t("phase_thinking")}
+              </Badge>
+            )}
+          </span>
+        ) : r.phase === "thinking" ? (
+          <Badge variant="outline" className="whitespace-nowrap border-violet-500 text-violet-500">
+            {t("phase_thinking")}
+          </Badge>
+        ) : (
+          "–"
+        );
       default:
         return null;
     }
@@ -229,6 +267,19 @@ export default function Requests() {
         ),
       },
       {
+        id: "effort",
+        label: t("reasoning_effort"),
+        render: (log) => {
+          const stufe = effortLabel(log.request_config ?? { reasoning_effort: log.reasoning_effort }, t);
+          const rest = configParts(log.request_config, t, formatNumber).join(" · ");
+          return stufe || rest ? (
+            <span title={rest || undefined}>{stufe ?? "–"}</span>
+          ) : (
+            "–"
+          );
+        },
+      },
+      {
         id: "status",
         label: t("status"),
         render: (log) => statusBadge(log.status),
@@ -249,6 +300,19 @@ export default function Requests() {
         label: t("completion_tokens"),
         className: "text-right",
         render: (log) => (log.completion_tokens > 0 ? formatNumber(log.completion_tokens) : "–"),
+      },
+      {
+        id: "reasoning",
+        label: t("reasoning_tokens"),
+        className: "text-right",
+        render: (log) =>
+          (log.reasoning_tokens ?? 0) > 0 ? (
+            <span title={t(log.reasoning_exact ? "generated_reported" : "generated_estimated")}>
+              {generatedLabel(log.reasoning_tokens, log.reasoning_exact, formatNumber)}
+            </span>
+          ) : (
+            "–"
+          ),
       },
       {
         id: "total_tokens",
@@ -321,11 +385,13 @@ export default function Requests() {
     if (provider) params.set("provider", provider);
     if (model) params.set("model", model);
     if (statusFilter) params.set("status", statusFilter);
+    if (effort) params.set("effort", effort);
     api
-      .get<{ logs: LogEntry[]; total: number }>(`/logs?${params.toString()}`)
+      .get<{ logs: LogEntry[]; total: number; efforts?: string[] }>(`/logs?${params.toString()}`)
       .then((r) => {
         setLogs(r.logs);
         setTotal(r.total);
+        setEfforts(r.efforts ?? []);
         setLoadError(null);
         setLoadedOnce(true);
       })
@@ -333,7 +399,7 @@ export default function Requests() {
         setLoadError(e instanceof Error ? e.message : t("load_failed"));
         setLoadedOnce(true);
       });
-  }, [keyName, provider, model, statusFilter, hours, page, pageSize, t]);
+  }, [keyName, provider, model, statusFilter, effort, hours, page, pageSize, t]);
 
   // filterwechsel -> zurueck auf seite 1
   const resetPage = () => setPage(0);
@@ -369,6 +435,9 @@ export default function Requests() {
           tokensPerS: null,
           prompt: ev.prompt_tokens ? ev.prompt_tokens : null,
           promptExact: false,
+          reasoningExact: false,
+          phase: null,
+          config: ev.config,
         },
         ...prev,
       ]);
@@ -384,6 +453,8 @@ export default function Requests() {
                 reasoning: ev.reasoning_tokens,
                 exact: ev.tokens_exact,
                 tokensPerS: ev.tokens_per_s,
+                reasoningExact: ev.reasoning_exact ?? false,
+                phase: ev.phase ?? r.phase,
                 // die gemeldete prefill-zahl ersetzt die schaetzung vom start
                 ...(ev.prompt_tokens != null ? { prompt: ev.prompt_tokens, promptExact: true } : {}),
               }
@@ -412,6 +483,7 @@ export default function Requests() {
         !(log.original_model && log.original_model.toLowerCase().includes(f.model.toLowerCase()))
       )
         return;
+      if (f.effort && (log.reasoning_effort ?? "") !== (f.effort === "_" ? "" : f.effort)) return;
       if (f.statusFilter) {
         const s = log.status;
         const bucket = s >= 200 && s < 300 ? "200" : s >= 400 && s < 500 ? "400" : "500";
@@ -477,6 +549,15 @@ export default function Requests() {
           <option value="200">2xx</option>
           <option value="400">4xx</option>
           <option value="500">5xx</option>
+        </Select>
+        <Select className="w-full sm:w-40" value={effort} onChange={(e) => { resetPage(); setEffort(e.target.value); }}>
+          <option value="">{t("all_efforts")}</option>
+          <option value="_">{t("effort_unset")}</option>
+          {[...new Set([...efforts, ...(effort && effort !== "_" ? [effort] : [])])].map((e) => (
+            <option key={e} value={e}>
+              {e}
+            </option>
+          ))}
         </Select>
         <Select className="w-full sm:w-36" value={hours} onChange={(e) => { resetPage(); setHours(Number(e.target.value)); }}>
           <option value={1}>{t("last_hour")}</option>

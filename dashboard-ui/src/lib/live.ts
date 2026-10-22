@@ -4,7 +4,7 @@
  * completed-events (SSE). Bewusst framework-frei, damit die Logik unit-
  * testbar ist.
  */
-import type { InFlightRequest, LiveProviderStats } from "./api";
+import type { InFlightRequest, LiveProviderStats, RequestConfig } from "./api";
 
 /**
  * Decode-TPS eines Providers w\u00e4hlen: live-metric bevorzugt, dann das
@@ -105,6 +105,9 @@ export interface CompletedInfo {
   is_redirect?: boolean;
   /** bedientes Modell (aus dem SSE-completed-Event; `entry.model` ist das angefragte) */
   model?: string;
+  /** davon Nachdenken und die Denkstufe (Alt-Daten: fehlen) */
+  reasoning_tokens?: number;
+  reasoning_effort?: string;
 }
 
 /**
@@ -368,6 +371,41 @@ export function generatedTitle(
   if (reasoning != null && reasoning > 0) teile.push(t("generated_reasoning", { n: formatNumber(reasoning) }));
   teile.push(t(exact ? "generated_reported" : "generated_estimated"));
   return teile.join(" · ");
+}
+
+/** Denkstufe fuer die Anzeige (null ohne Angabe); von yalr gesetzt bekommt einen Zusatz. */
+export function effortLabel(
+  config: RequestConfig | null | undefined,
+  t: (key: "effort_by_gateway") => string,
+): string | null {
+  const e = config?.reasoning_effort;
+  if (!e) return null;
+  return config?.effort_by_gateway ? `${e} (${t("effort_by_gateway")})` : e;
+}
+
+/** Kurzangaben der uebrigen Konfiguration (ohne Denkstufe) fuer die Anzeige. */
+export function configParts(
+  config: RequestConfig | null | undefined,
+  t: (
+    key: "config_temperature" | "config_top_p" | "config_max_tokens" | "config_tools" | "config_json",
+    params?: Record<string, string | number>,
+  ) => string,
+  formatNumber: (v: number) => string,
+): string[] {
+  if (!config) return [];
+  const teile: string[] = [];
+  if (config.temperature != null) teile.push(t("config_temperature", { v: formatNumber(config.temperature) }));
+  if (config.top_p != null) teile.push(t("config_top_p", { v: formatNumber(config.top_p) }));
+  if (config.max_tokens != null) teile.push(t("config_max_tokens", { n: formatNumber(config.max_tokens) }));
+  if (config.tools) teile.push(t("config_tools", { n: config.tools }));
+  if (config.json_mode) teile.push(t("config_json"));
+  return teile;
+}
+
+/** Denk-Anteil an den erzeugten Tokens (0..1), null ohne Daten. */
+export function reasoningShare(reasoning: number | null | undefined, completion: number | null | undefined): number | null {
+  if (!reasoning || !completion || completion <= 0) return null;
+  return Math.min(1, reasoning / completion);
 }
 
 /** Tooltip der Prefill-Tokens eines laufenden Requests: woher die Zahl stammt. */

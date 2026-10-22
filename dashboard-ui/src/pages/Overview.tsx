@@ -34,7 +34,15 @@ import { useToast } from "@/components/ui/toast";
 import { useChartTheme } from "@/lib/chartTheme";
 import { cn } from "@/lib/utils";
 import { formatTps, formatPercent } from "@/lib/format";
-import { completedRates, generatedLabel, generatedTitle, promptTitle } from "@/lib/live";
+import {
+  completedRates,
+  configParts,
+  effortLabel,
+  generatedLabel,
+  generatedTitle,
+  promptTitle,
+  reasoningShare,
+} from "@/lib/live";
 import { useLanguage, useCurrency, type TranslationKey } from "@/lib/i18n";
 
 function errorRateClass(rate: number) {
@@ -98,7 +106,7 @@ export default function Overview() {
         .then((r) => setTs(r.timeseries))
         .catch(fail);
       api
-        .get<{ breakdown: BreakdownItem[] }>(`/breakdown${qs}&group_by=model_provider`, {
+        .get<{ breakdown: BreakdownItem[] }>(`/breakdown${qs}&group_by=model_provider_effort`, {
           signal: controller.signal,
         })
         .then((r) => setByModel(r.breakdown))
@@ -239,6 +247,8 @@ export default function Overview() {
         original_model: log.original_model,
         is_redirect: log.is_redirect,
         model: log.model,
+        reasoning_tokens: log.reasoning_tokens,
+        reasoning_effort: log.reasoning_effort,
       };
     });
     return () => es.close();
@@ -719,23 +729,34 @@ export default function Overview() {
                 <TableRow>
                   <TableHead>{t("model")}</TableHead>
                   <TableHead>{t("provider")}</TableHead>
+                  <TableHead>{t("reasoning_effort")}</TableHead>
                   <TableHead className="text-right">{t("requests")}</TableHead>
                   <TableHead className="text-right">{t("tokens")}</TableHead>
+                  <TableHead className="text-right">{t("reasoning_share")}</TableHead>
+                  <TableHead className="text-right">{t("avg_duration_short")}</TableHead>
                   <TableHead className="text-right">{t("cost")}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {byModel.map((m) => (
-                  <TableRow key={`${m.group}-${m.provider_name ?? ""}`}>
-                    <TableCell className="font-medium">{m.group}</TableCell>
-                    <TableCell className="text-muted-foreground">
-                      {m.provider_name || "–"}
-                    </TableCell>
-                    <TableCell className="text-right">{formatNumber(m.requests)}</TableCell>
-                    <TableCell className="text-right">{formatNumber(m.tokens)}</TableCell>
-                    <TableCell className="text-right">{formatCost(m.cost)}</TableCell>
-                  </TableRow>
-                ))}
+                {byModel.map((m) => {
+                  const anteil = reasoningShare(m.reasoning_tokens, m.completion_tokens);
+                  return (
+                    <TableRow key={`${m.group}-${m.provider_name ?? ""}-${m.effort ?? ""}`}>
+                      <TableCell className="font-medium">{m.group}</TableCell>
+                      <TableCell className="text-muted-foreground">{m.provider_name || "–"}</TableCell>
+                      <TableCell className="text-muted-foreground">{m.effort || "–"}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatNumber(m.requests)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatNumber(m.tokens)}</TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {anteil !== null ? formatPercent(anteil * 100, locale) : "–"}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {m.requests > 0 && m.duration_sum_ms != null ? formatDuration(m.duration_sum_ms / m.requests) : "–"}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">{formatCost(m.cost)}</TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           )}
@@ -812,6 +833,17 @@ function LiveRequestRow({
                 {t("decode_tokens")}:{" "}
                 <span className="font-mono tabular-nums">{formatNumber(c.completion_tokens)}</span>
               </span>
+              {(c.reasoning_tokens ?? 0) > 0 && (
+                <span className="shrink-0">
+                  {t("reasoning_tokens")}:{" "}
+                  <span className="font-mono tabular-nums">{formatNumber(c.reasoning_tokens ?? 0)}</span>
+                </span>
+              )}
+              {c.reasoning_effort && (
+                <span className="shrink-0">
+                  {t("reasoning_effort")}: <span className="font-medium">{c.reasoning_effort}</span>
+                </span>
+              )}
               <span className="shrink-0">
                 {t("prefill_tps")}:{" "}
                 <span className="font-mono tabular-nums">{formatTps(rates!.prefill, locale)}</span>
@@ -837,6 +869,27 @@ function LiveRequestRow({
               <span className="shrink-0">
                 {t("running_for", { d: formatDuration(Math.max(0, now - tr.entry.started_at_ms)) })}
               </span>
+              {tr.entry.phase && (
+                <Badge
+                  variant="outline"
+                  className={cn(
+                    "shrink-0 whitespace-nowrap",
+                    tr.entry.phase === "thinking" ? "border-violet-500 text-violet-500" : "border-emerald-500 text-emerald-500",
+                  )}
+                >
+                  {t(tr.entry.phase === "thinking" ? "phase_thinking" : "phase_answering")}
+                </Badge>
+              )}
+              {effortLabel(tr.entry.config, t) && (
+                <span className="shrink-0" title={configParts(tr.entry.config, t, formatNumber).join(" · ") || undefined}>
+                  {t("reasoning_effort")}: <span className="font-medium">{effortLabel(tr.entry.config, t)}</span>
+                </span>
+              )}
+              {configParts(tr.entry.config, t, formatNumber).length > 0 && (
+                <span className="min-w-0 max-w-56 truncate text-muted-foreground" title={configParts(tr.entry.config, t, formatNumber).join(" · ")}>
+                  {configParts(tr.entry.config, t, formatNumber).join(" · ")}
+                </span>
+              )}
               {tr.entry.prompt_tokens != null && (
                 <span className="shrink-0" title={promptTitle(tr.entry.prompt_tokens_exact, t)}>
                   {t("prefill_tokens")}:{" "}
@@ -856,6 +909,14 @@ function LiveRequestRow({
                       {generatedLabel(tr.entry.generated_tokens, tr.entry.tokens_exact, formatNumber)}
                     </span>
                   </span>
+                  {(tr.entry.reasoning_tokens ?? 0) > 0 && (
+                    <span className="shrink-0" title={t(tr.entry.reasoning_exact ? "generated_reported" : "generated_estimated")}>
+                      {t("reasoning_tokens")}:{" "}
+                      <span className="font-mono tabular-nums">
+                        {generatedLabel(tr.entry.reasoning_tokens, tr.entry.reasoning_exact, formatNumber)}
+                      </span>
+                    </span>
+                  )}
                   <span className="shrink-0">
                     {t("decode_tps")}:{" "}
                     <span className="font-mono tabular-nums">{formatTps(tr.entry.tokens_per_s ?? null, locale)}</span>

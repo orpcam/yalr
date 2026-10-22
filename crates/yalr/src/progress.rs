@@ -12,11 +12,22 @@
 //! aus der Anfrage; meldet der Anbieter die Zahl im Stream (Anthropic gleich zu
 //! Beginn in `message_start`, OpenAI/vLLM mit `include_usage` im letzten Chunk,
 //! Gemini in `usageMetadata`), geht sie mit dem naechsten Zwischenstand raus.
+//!
+//! Dazu kommt die Phase (denkt nach / antwortet, an der Art der letzten Daten)
+//! und die vom Anbieter gemeldete Zahl der Denk-Tokens (OpenAI/OpenRouter
+//! `completion_tokens_details.reasoning_tokens`, Gemini `thoughtsTokenCount`).
+//! [`reasoning_aus_antwort`] zaehlt das Nachdenken einer fertigen Antwort fuer
+//! das Log.
 
 use std::time::{Duration, Instant};
 
 use ingest::{LiveEvent, LogSink};
 use serde_json::Value;
+
+/// Phase eines Streams: das Modell denkt nach.
+pub const DENKT: &str = "thinking";
+/// Phase eines Streams: das Modell schreibt die Antwort (Text oder Werkzeug-Aufruf).
+pub const ANTWORTET: &str = "answering";
 
 /// Hoechstens so oft geht ein Zwischenstand je Request an das Dashboard.
 const MELDE_TAKT: Duration = Duration::from_secs(1);
@@ -32,6 +43,11 @@ pub struct StreamProgress {
     gemeldet: Option<u64>,
     /// vom Anbieter gemeldete Zahl der Prefill-Tokens (falls vorhanden)
     prompt_gemeldet: Option<u64>,
+    /// vom Anbieter gemeldete Zahl der Denk-Tokens (falls vorhanden)
+    reasoning_gemeldet: Option<u64>,
+    /// woran das Modell zuletzt geschrieben hat ([`DENKT`] / [`ANTWORTET`])
+    phase: Option<&'static str>,
+    zuletzt_phase: Option<&'static str>,
     /// angefangene SSE-Zeile aus dem letzten Byte-Stueck
     zeile: Vec<u8>,
     zuletzt: Option<Instant>,
@@ -50,6 +66,10 @@ pub struct Stand {
     pub exact: bool,
     /// Prefill-Tokens, sobald der Anbieter sie meldet
     pub prompt_tokens: Option<u64>,
+    /// true, wenn `reasoning_tokens` vom Anbieter stammt
+    pub reasoning_exact: bool,
+    /// [`DENKT`] oder [`ANTWORTET`], None vor den ersten Daten
+    pub phase: Option<&'static str>,
 }
 
 fn geschaetzt(bytes: u64) -> u64 {
@@ -90,6 +110,9 @@ impl StreamProgress {
             reasoning_bytes: 0,
             gemeldet: None,
             prompt_gemeldet: None,
+            reasoning_gemeldet: None,
+            phase: None,
+            zuletzt_phase: None,
             zeile: Vec::new(),
             zuletzt: None,
             zuletzt_tokens: 0,
@@ -129,19 +152,24 @@ impl StreamProgress {
             for c in choices {
                 let Some(d) = c.get("delta") else { continue };
                 let reasoning = text_len(d.get("reasoning_content")) + text_len(d.get("reasoning"));
-                self.reasoning_bytes += reasoning;
-                self.bytes += reasoning + text_len(d.get("content"));
+                let mut antwort = text_len(d.get("content"));
                 if let Some(calls) = d.get("tool_calls").and_then(|t| t.as_array()) {
                     for call in calls {
-                        self.bytes += text_len(call.pointer("/function/arguments"));
+                        antwort += text_len(call.pointer("/function/arguments"));
                     }
                 }
+                self.reasoning_bytes += reasoning;
+                self.bytes += reasoning + antwort;
+                self.phase_nach(reasoning, antwort);
             }
             if let Some(n) = v.pointer("/usage/completion_tokens").and_then(|n| n.as_u64()) {
                 self.gemeldet = Some(n);
             }
             if let Some(n) = v.pointer("/usage/prompt_tokens").and_then(|n| n.as_u64()) {
                 self.prompt_gemeldet = Some(n);
+            }
+            if let Some(n) = v.pointer("/usage/completion_tokens_details/reasoning_tokens").and_then(|n| n.as_u64()) {
+                self.reasoning_gemeldet = Some(n);
             }
             return;
         }
@@ -150,10 +178,19 @@ impl StreamProgress {
             Some("content_block_delta") => {
                 let d = v.get("delta");
                 let thinking = text_len(d.and_then(|d| d.get("thinking")));
+                let antwort = text_len(d.and_then(|d| d.get("text"))) + text_len(d.and_then(|d| d.get("partial_json")));
                 self.reasoning_bytes += thinking;
-                self.bytes += thinking
-                    + text_len(d.and_then(|d| d.get("text")))
-                    + text_len(d.and_then(|d| d.get("partial_json")));
+                self.bytes += thinking + antwort;
+                self.phase_nach(thinking, antwort);
+                return;
+            }
+            Some("content_block_start") => {
+                // der neue block sagt die phase schon an, bevor text kommt
+                match v.pointer("/content_block/type").and_then(|t| t.as_str()) {
+                    Some("thinking" | "redacted_thinking") => self.phase = Some(DENKT),
+                    Some("text" | "tool_use") => self.phase = Some(ANTWORTET),
+                    _ => {}
+                }
                 return;
             }
             Some("message_start") => {
@@ -182,6 +219,9 @@ impl StreamProgress {
                     let n = text_len(p.get("text"));
                     if p.get("thought").and_then(|t| t.as_bool()) == Some(true) {
                         self.reasoning_bytes += n;
+                        self.phase_nach(n, 0);
+                    } else {
+                        self.phase_nach(0, n);
                     }
                     self.bytes += n;
                 }
@@ -196,6 +236,9 @@ impl StreamProgress {
             if let Some(n) = u.get("promptTokenCount").and_then(|n| n.as_u64()) {
                 self.prompt_gemeldet = Some(n);
             }
+            if let Some(n) = gedanken {
+                self.reasoning_gemeldet = Some(n);
+            }
         }
     }
 
@@ -209,14 +252,28 @@ impl StreamProgress {
         }
     }
 
+    /// Phase nach einem Stueck Daten: Antwort-Text schlaegt Nachdenken.
+    fn phase_nach(&mut self, denken: u64, antwort: u64) {
+        if antwort > 0 {
+            self.phase = Some(ANTWORTET);
+        } else if denken > 0 {
+            self.phase = Some(DENKT);
+        }
+    }
+
     pub fn stand(&self) -> Stand {
         let schaetzung = geschaetzt(self.bytes);
-        let reasoning_tokens = geschaetzt(self.reasoning_bytes);
         let prompt_tokens = self.prompt_gemeldet.filter(|n| *n > 0);
-        match self.gemeldet {
-            Some(n) if n > 0 && n >= schaetzung => Stand { tokens: n, reasoning_tokens, exact: true, prompt_tokens },
-            _ => Stand { tokens: schaetzung, reasoning_tokens, exact: false, prompt_tokens },
-        }
+        // gemeldetes nachdenken gilt, sobald es da ist (OpenAI streamt es gar nicht)
+        let (reasoning_tokens, reasoning_exact) = match self.reasoning_gemeldet {
+            Some(n) if n > 0 => (n, true),
+            _ => (geschaetzt(self.reasoning_bytes), false),
+        };
+        let (tokens, exact) = match self.gemeldet {
+            Some(n) if n > 0 && n >= schaetzung => (n, true),
+            _ => (schaetzung, false),
+        };
+        Stand { tokens, reasoning_tokens, exact, prompt_tokens, reasoning_exact, phase: self.phase }
     }
 
     /// Stand melden, wenn sich etwas getan hat und der letzte Zwischenstand
@@ -230,7 +287,7 @@ impl StreamProgress {
         if stand.tokens > 0 && self.erstes.is_none() {
             self.erstes = Some(jetzt);
         }
-        if stand.tokens == self.zuletzt_tokens && stand.prompt_tokens == self.zuletzt_prompt {
+        if stand.tokens == self.zuletzt_tokens && stand.prompt_tokens == self.zuletzt_prompt && stand.phase == self.zuletzt_phase {
             return;
         }
         if self.zuletzt.is_some_and(|t| jetzt.duration_since(t) < MELDE_TAKT) {
@@ -239,6 +296,7 @@ impl StreamProgress {
         self.zuletzt = Some(jetzt);
         self.zuletzt_tokens = stand.tokens;
         self.zuletzt_prompt = stand.prompt_tokens;
+        self.zuletzt_phase = stand.phase;
         // tokens/s erst ab einer sekunde seit dem ersten zeichen (sonst zu zappelig)
         let tokens_per_s = self.erstes.and_then(|t| {
             let s = jetzt.duration_since(t).as_secs_f64();
@@ -251,8 +309,55 @@ impl StreamProgress {
             tokens_exact: stand.exact,
             tokens_per_s,
             prompt_tokens: stand.prompt_tokens,
+            reasoning_exact: stand.reasoning_exact,
+            phase: stand.phase.map(str::to_string),
         });
     }
+}
+
+/// Nachdenken einer fertigen Antwort fuer das Log: (Tokens, vom Anbieter
+/// gemeldet). `body` ist entweder der rohe Stream (SSE) oder das JSON einer
+/// Antwort ohne Stream.
+pub fn reasoning_aus_antwort(body: &str) -> (u64, bool) {
+    if body.lines().any(|z| z.starts_with("data:")) {
+        let mut p = StreamProgress::new("");
+        p.feed(body.as_bytes());
+        p.feed(b"\n");
+        let s = p.stand();
+        return (s.reasoning_tokens, s.reasoning_exact);
+    }
+    serde_json::from_str::<Value>(body).map(|v| reasoning_aus_json(&v)).unwrap_or((0, false))
+}
+
+/// Wie [`reasoning_aus_antwort`] fuer das JSON einer Antwort ohne Stream
+/// (OpenAI-, Anthropic- oder Gemini-Form).
+pub fn reasoning_aus_json(v: &Value) -> (u64, bool) {
+    let gemeldet = v
+        .pointer("/usage/completion_tokens_details/reasoning_tokens")
+        .or_else(|| v.pointer("/usageMetadata/thoughtsTokenCount"))
+        .and_then(|n| n.as_u64())
+        .filter(|n| *n > 0);
+    if let Some(n) = gemeldet {
+        return (n, true);
+    }
+    let mut bytes = 0;
+    for c in v.get("choices").and_then(|c| c.as_array()).into_iter().flatten() {
+        let m = c.get("message");
+        bytes += text_len(m.and_then(|m| m.get("reasoning_content"))) + text_len(m.and_then(|m| m.get("reasoning")));
+    }
+    for b in v.get("content").and_then(|c| c.as_array()).into_iter().flatten() {
+        if b.get("type").and_then(|t| t.as_str()) == Some("thinking") {
+            bytes += text_len(b.get("thinking"));
+        }
+    }
+    for c in v.get("candidates").and_then(|c| c.as_array()).into_iter().flatten() {
+        for p in c.pointer("/content/parts").and_then(|p| p.as_array()).into_iter().flatten() {
+            if p.get("thought").and_then(|t| t.as_bool()) == Some(true) {
+                bytes += text_len(p.get("text"));
+            }
+        }
+    }
+    (geschaetzt(bytes), false)
 }
 
 #[cfg(test)]
@@ -260,15 +365,62 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// (tokens, reasoning_tokens, exact) eines Zaehlers
+    fn kurz(p: &StreamProgress) -> (u64, u64, bool) {
+        let s = p.stand();
+        (s.tokens, s.reasoning_tokens, s.exact)
+    }
+
+    #[test]
+    fn phase_follows_the_last_data() {
+        let mut p = StreamProgress::new("r");
+        assert_eq!(p.stand().phase, None);
+        p.observe(&json!({"choices":[{"delta":{"reasoning_content":"hmm"}}]}));
+        assert_eq!(p.stand().phase, Some(DENKT));
+        p.observe(&json!({"choices":[{"delta":{"content":"Antwort"}}]}));
+        assert_eq!(p.stand().phase, Some(ANTWORTET));
+        // anthropic: der block-start sagt die phase an
+        let mut p = StreamProgress::new("r");
+        p.observe(&json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}));
+        assert_eq!(p.stand().phase, Some(DENKT));
+        p.observe(&json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}));
+        assert_eq!(p.stand().phase, Some(ANTWORTET));
+    }
+
+    #[test]
+    fn reported_reasoning_tokens_win() {
+        // openai-reasoning: nachdenken wird nicht gestreamt, nur am ende gemeldet
+        let mut p = StreamProgress::new("r");
+        p.observe(&json!({"choices":[{"delta":{"content":"abcd"}}]}));
+        p.observe(&json!({"choices":[],"usage":{"completion_tokens":900,"completion_tokens_details":{"reasoning_tokens":880}}}));
+        let s = p.stand();
+        assert_eq!((s.reasoning_tokens, s.reasoning_exact, s.tokens), (880, true, 900));
+    }
+
+    #[test]
+    fn reasoning_of_a_finished_answer() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"reasoning\":\"12345678\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]";
+        assert_eq!(reasoning_aus_antwort(sse), (2, false));
+        let openai = json!({"choices":[{"message":{"content":"ok","reasoning_content":"abcdefgh"}}]});
+        assert_eq!(reasoning_aus_antwort(&openai.to_string()), (2, false));
+        let gemeldet = json!({"choices":[{"message":{"content":"ok"}}],"usage":{"completion_tokens_details":{"reasoning_tokens":321}}});
+        assert_eq!(reasoning_aus_json(&gemeldet), (321, true));
+        let anthropic = json!({"content":[{"type":"thinking","thinking":"abcdefghijkl"},{"type":"text","text":"ok"}]});
+        assert_eq!(reasoning_aus_json(&anthropic), (3, false));
+        let gemini = json!({"candidates":[],"usageMetadata":{"thoughtsTokenCount":44}});
+        assert_eq!(reasoning_aus_json(&gemini), (44, true));
+        assert_eq!(reasoning_aus_antwort(""), (0, false));
+    }
+
     #[test]
     fn openai_chunks_across_pieces() {
         let mut p = StreamProgress::new("r");
         let a = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"abcdefgh\"}}]}\n\ndata: {\"choi";
         let b = "ces\":[{\"delta\":{\"content\":\"1234\"}}]}\r\n\r\ndata: [DONE]\n\n";
         p.feed(a.as_bytes());
-        assert_eq!(p.stand(), Stand { tokens: 2, reasoning_tokens: 2, exact: false, prompt_tokens: None });
+        assert_eq!(kurz(&p), (2, 2, false));
         p.feed(b.as_bytes());
-        assert_eq!(p.stand(), Stand { tokens: 3, reasoning_tokens: 2, exact: false, prompt_tokens: None });
+        assert_eq!(kurz(&p), (3, 2, false));
     }
 
     #[test]
@@ -278,7 +430,7 @@ mod tests {
         assert_eq!(p.stand().tokens, 2);
         // die gemeldete zahl gilt, sobald sie die schaetzung erreicht
         p.observe(&json!({"choices":[],"usage":{"completion_tokens":40}}));
-        assert_eq!(p.stand(), Stand { tokens: 40, reasoning_tokens: 0, exact: true, prompt_tokens: None });
+        assert_eq!(kurz(&p), (40, 0, true));
     }
 
     #[test]
@@ -286,7 +438,7 @@ mod tests {
         let mut p = StreamProgress::new("r");
         p.observe(&json!({"type":"message_delta","usage":{"output_tokens":1}}));
         p.observe(&json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"x".repeat(40)}}));
-        assert_eq!(p.stand(), Stand { tokens: 10, reasoning_tokens: 0, exact: false, prompt_tokens: None });
+        assert_eq!(kurz(&p), (10, 0, false));
     }
 
     #[test]
@@ -295,18 +447,19 @@ mod tests {
         p.observe(&json!({"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"12345678"}}));
         p.observe(&json!({"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"x\":"}}));
         p.observe(&json!({"type":"ping"}));
-        assert_eq!(p.stand(), Stand { tokens: 4, reasoning_tokens: 2, exact: false, prompt_tokens: None });
+        assert_eq!(kurz(&p), (4, 2, false));
         p.observe(&json!({"type":"message_delta","usage":{"output_tokens":12}}));
-        assert_eq!(p.stand(), Stand { tokens: 12, reasoning_tokens: 2, exact: true, prompt_tokens: None });
+        assert_eq!(kurz(&p), (12, 2, true));
     }
 
     #[test]
     fn gemini_chunks() {
         let mut p = StreamProgress::new("r");
         p.observe(&json!({"candidates":[{"content":{"parts":[{"text":"abcd","thought":true},{"text":"efgh"}]}}]}));
-        assert_eq!(p.stand(), Stand { tokens: 2, reasoning_tokens: 1, exact: false, prompt_tokens: None });
+        assert_eq!(kurz(&p), (2, 1, false));
         p.observe(&json!({"candidates":[],"usageMetadata":{"candidatesTokenCount":5,"thoughtsTokenCount":3}}));
-        assert_eq!(p.stand(), Stand { tokens: 8, reasoning_tokens: 1, exact: true, prompt_tokens: None });
+        // gemeldetes nachdenken (thoughtsTokenCount) ersetzt die schaetzung
+        assert_eq!(kurz(&p), (8, 3, true));
     }
 
     #[test]

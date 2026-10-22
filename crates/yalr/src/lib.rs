@@ -1,6 +1,7 @@
 pub mod config;
 pub mod playground;
 pub mod progress;
+pub mod request_config;
 pub mod proxy;
 pub mod router;
 
