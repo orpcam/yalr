@@ -4,6 +4,7 @@ pub mod progress;
 pub mod request_config;
 pub mod proxy;
 pub mod router;
+pub mod transkription;
 
 pub use common::state;
 pub use common::crypto;

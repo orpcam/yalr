@@ -5,8 +5,8 @@ YALR is a self-hosted LLM gateway (similar to Helicone/LiteLLM) written in Rust:
 ## Features
 
 - **Unified API**: OpenAI-compatible endpoints (`/v1/chat/completions`,
-  `/v1/embeddings`, `/v1/audio/speech`, `/v1/models`) plus the native Anthropic
-  format (`/v1/messages`)
+  `/v1/embeddings`, `/v1/audio/speech`, `/v1/audio/transcriptions`,
+  `/v1/models`) plus the native Anthropic format (`/v1/messages`)
 - **Providers**: OpenAI, Anthropic, Google Gemini, and any OpenAI-compatible
   service (Ollama, Groq, DeepSeek, Mistral, Together, vLLM, ...) — including
   transparent format translation in both directions
@@ -109,6 +109,7 @@ virtual key as the API key.
 | `POST /v1/messages` | Native Anthropic format (passthrough to Anthropic) |
 | `POST /v1/embeddings` | Embeddings (OpenAI-compatible providers) |
 | `POST /v1/audio/speech` | Text-to-speech (OpenAI-compatible providers). The audio is streamed through chunk by chunk, unchanged, with its content type — so `"stream_format": "audio"` reaches the client without delay; the request log stores only type, size and first-byte time |
+| `POST /v1/audio/transcriptions` | Speech-to-text (OpenAI-compatible providers, `multipart/form-data` up to 64 MB). The model name is rewritten to the upstream model, all other form fields pass through unchanged; the response (JSON or text) is returned as is. The request log stores the form fields and only type and size of the uploaded file; no tokens, no cost |
 | `GET /v1/models` | Available (mapped) models |
 | `GET /health` | Healthcheck (liveness) |
 

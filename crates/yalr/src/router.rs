@@ -12,6 +12,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/embeddings", post(proxy::proxy))
         .route("/v1/messages", post(proxy::proxy))
         .route("/v1/audio/speech", post(proxy::proxy))
+        .route("/v1/audio/transcriptions", post(proxy::proxy))
         .route("/v1/models", get(proxy::models_list))
         // Dashboard-Playground (Session statt API-Key); Body wird im Handler
         // roh gelesen (10 MB), keine Extractor-Grenze.

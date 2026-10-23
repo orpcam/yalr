@@ -162,7 +162,8 @@ pub fn provider_override(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Behandelt `/v1/chat/completions`, `/v1/embeddings`, `/v1/messages`, `/v1/audio/speech` und `/v1/models`.
+/// Behandelt `/v1/chat/completions`, `/v1/embeddings`, `/v1/messages`, `/v1/audio/speech`,
+/// `/v1/audio/transcriptions` und `/v1/models`.
 pub async fn proxy(
     State(state): State<AppState>,
     request: axum::extract::Request,
@@ -170,11 +171,31 @@ pub async fn proxy(
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
     let endpoint = endpoint_from_uri(&parts.uri);
-    let body = axum::body::to_bytes(body, MAX_BODY_BYTES)
+    let transkription = endpoint == crate::transkription::ENDPOINT;
+    let limit = if transkription { crate::transkription::MAX_UPLOAD_BYTES } else { MAX_BODY_BYTES };
+    let body = axum::body::to_bytes(body, limit)
         .await
         .unwrap_or_default();
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
+
+    // Spracherkennung: Multipart am Eingang in das JSON der Pipeline übersetzen
+    // (die Datei als Data-URL – das Protokoll lässt sie weg). Schlägt das fehl,
+    // kommt nichts vom rohen Upload ins Protokoll.
+    let body = if transkription {
+        let content_type = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        match crate::transkription::als_json(content_type, body).await {
+            Ok(v) => bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default()),
+            Err(msg) => {
+                return error_response(state, None, None, &request_id, &endpoint, started, StatusCode::BAD_REQUEST, "invalid_multipart", &msg, 0, &bytes::Bytes::new()).await;
+            }
+        }
+    } else {
+        body
+    };
 
     // 1) Auth
     let vk = match auth::authenticate(&state, &headers).await {
@@ -493,11 +514,12 @@ async fn execute_once(
 ) -> Result<ProxyOutcome, ProviderError> {
     // Audio gibt es nur bei OpenAI-kompatiblen Providern; alles andere würde
     // unten stillschweigend als Chat übersetzt.
-    if endpoint == AUDIO_SPEECH && !matches!(target.provider_kind, ProviderKind::OpenAi | ProviderKind::OpenAiCompat) {
+    let audio = endpoint == AUDIO_SPEECH || endpoint == crate::transkription::ENDPOINT;
+    if audio && !matches!(target.provider_kind, ProviderKind::OpenAi | ProviderKind::OpenAiCompat) {
         return Err(ProviderError::Status {
             status: 400,
             body: format!(
-                "{AUDIO_SPEECH} is only supported by OpenAI-compatible providers (provider '{}' is {})",
+                "{endpoint} is only supported by OpenAI-compatible providers (provider '{}' is {})",
                 target.provider_name,
                 target.provider_kind.as_str()
             ),
@@ -532,6 +554,9 @@ async fn openai_call(
 ) -> Result<ProxyOutcome, ProviderError> {
     if endpoint == AUDIO_SPEECH {
         return openai_audio_call(state, target, vk, endpoint, req_json, request_id, routing).await;
+    }
+    if endpoint == crate::transkription::ENDPOINT {
+        return openai_transcription_call(state, target, endpoint, req_json, routing).await;
     }
     let mut body = req_json.clone();
     if wants_stream {
@@ -671,6 +696,45 @@ async fn openai_audio_call(
             .unwrap(),
         // is_stream + status 0: proxy() protokolliert nicht selbst (siehe oben)
         log: empty_log(state, target, endpoint, req_json),
+    })
+}
+
+/// Spracherkennung (`/v1/audio/transcriptions`): aus dem JSON der Pipeline wird
+/// wieder Multipart (Modell auf das Upstream-Modell umgeschrieben), die Antwort
+/// (JSON oder Text) geht unverändert mit ihrem Typ zurück. Ins Log kommt die
+/// Antwort, vom Upload nur Typ und Größe (Data-URL, `redact_for_log`). Keine
+/// Tokens, keine Kosten.
+async fn openai_transcription_call(
+    state: &AppState,
+    target: &RouteTarget,
+    endpoint: &str,
+    req_json: &Value,
+    routing: &RoutingInfo,
+) -> Result<ProxyOutcome, ProviderError> {
+    let form = crate::transkription::als_form(req_json, &target.upstream_model)
+        .map_err(|body| ProviderError::Status { status: 400, body })?;
+    let url = providers::openai::OpenAiAdapter::endpoint_url(&target.base_url, endpoint);
+    let resp = state.http.post(&url).bearer_auth(&target.api_key).multipart(form).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(ProviderError::Status { status: status.as_u16(), body: text });
+    }
+    let content_type = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let bytes = resp.bytes().await?;
+    let fuers_log = crate::transkription::antwort_fuers_log(&bytes);
+    Ok(ProxyOutcome {
+        response: Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", content_type)
+            .body(Body::from(bytes))
+            .unwrap(),
+        log: build_log_from_response(state, target, routing, endpoint, req_json, StatusCode::OK, &fuers_log, 0, 0, false, ""),
     })
 }
 
@@ -3121,6 +3185,21 @@ mod playground_tests {
             )
             .route("/fail/chat/completions", post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }))
             .route("/ok/audio/speech", post(|| async { ([("content-type", "audio/mpeg")], vec![7u8; 4096]) }))
+            // Spracherkennung: liest den Upload wie yalr am Eingang und meldet Modell, Sprache und Dateigröße zurück
+            .route(
+                "/ok/audio/transcriptions",
+                post(|headers: axum::http::HeaderMap, body: bytes::Bytes| async move {
+                    let ct = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+                    let v = crate::transkription::als_json(&ct, body).await.unwrap();
+                    let text = format!(
+                        "{}|{}|{}",
+                        v["model"].as_str().unwrap_or_default(),
+                        v["language"].as_str().unwrap_or_default(),
+                        v["file"].as_str().unwrap_or_default().len()
+                    );
+                    axum::Json(json!({ "text": text }))
+                }),
+            )
             .route(
                 "/sse/chat/completions",
                 post(|| async {
@@ -3332,6 +3411,57 @@ mod playground_tests {
         assert_eq!(hdr(&resp, "x-yalr-upstream-model"), Some("up-fb"));
         assert_eq!(hdr(&resp, "x-yalr-fallback"), Some("1"));
         assert_eq!(hdr(&resp, "x-yalr-attempts"), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn test_transkription_multipart_durch_die_pipeline() {
+        let base = mock_upstream().await;
+        let state = test_state();
+        state.routes.write().await.insert("asr".into(), vec![target(&format!("{base}/ok"), "asr-a", "asr", "whisper-up")]);
+        let (ct, body) = crate::transkription::multipart_fuer_test(
+            &[("model", "asr"), ("language", "de"), ("temperature", "0")],
+            &[1u8; 300],
+        );
+        let req = crate::transkription::als_json(&ct, body).await.unwrap();
+        // Ins Protokoll kommt der Upload nie, nur Typ und Größe.
+        let log = redact_for_log(&req);
+        assert!(log.contains("bytes omitted") && !log.contains("AQEB"), "{log}");
+        let resp = proxy_core(
+            &state,
+            crate::playground::playground_key(),
+            crate::transkription::ENDPOINT.into(),
+            bytes::Bytes::from(serde_json::to_vec(&req).unwrap()),
+            "r1".into(),
+            Instant::now(),
+            CoreOpts { provider_override: None, expose_routing: true },
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hdr(&resp, "x-yalr-upstream-model"), Some("whisper-up"));
+        let v: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap();
+        // Der Provider bekam Multipart mit dem Upstream-Modell, der Sprache und derselben Datei.
+        assert_eq!(v["text"], format!("whisper-up|de|{}", req["file"].as_str().unwrap().len()));
+    }
+
+    #[tokio::test]
+    async fn test_transkription_nur_openai_kompatibel() {
+        let base = mock_upstream().await;
+        let state = test_state();
+        let anthropic = RouteTarget { provider_kind: ProviderKind::Anthropic, ..target(&format!("{base}/ok"), "a", "asr", "up") };
+        state.routes.write().await.insert("asr".into(), vec![anthropic]);
+        let (ct, body) = crate::transkription::multipart_fuer_test(&[("model", "asr")], b"x");
+        let req = crate::transkription::als_json(&ct, body).await.unwrap();
+        let resp = proxy_core(
+            &state,
+            crate::playground::playground_key(),
+            crate::transkription::ENDPOINT.into(),
+            bytes::Bytes::from(serde_json::to_vec(&req).unwrap()),
+            "r2".into(),
+            Instant::now(),
+            CoreOpts::default(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

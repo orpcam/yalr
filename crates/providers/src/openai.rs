@@ -16,6 +16,7 @@ impl OpenAiAdapter {
             "/v1/chat/completions" => format!("{base}/chat/completions"),
             "/v1/embeddings" => format!("{base}/embeddings"),
             "/v1/audio/speech" => format!("{base}/audio/speech"),
+            "/v1/audio/transcriptions" => format!("{base}/audio/transcriptions"),
             "/v1/models" => format!("{base}/models"),
             _ => format!("{base}/chat/completions"),
         }
@@ -78,5 +79,6 @@ mod tests {
         assert_eq!(OpenAiAdapter::endpoint_url(base, "/v1/chat/completions"), "http://host:8765/v1/chat/completions");
         assert_eq!(OpenAiAdapter::endpoint_url(base, "/v1/embeddings"), "http://host:8765/v1/embeddings");
         assert_eq!(OpenAiAdapter::endpoint_url(base, "/v1/audio/speech"), "http://host:8765/v1/audio/speech");
+        assert_eq!(OpenAiAdapter::endpoint_url(base, "/v1/audio/transcriptions"), "http://host:8765/v1/audio/transcriptions");
     }
 }
